@@ -1,0 +1,472 @@
+# ==============================================================================
+# OCI Resource Manager Schema Definition
+# ==============================================================================
+# Purpose: Define UI and validation for deploying Autonomous Database 23ai/26ai
+#          directly from GitHub via OCI Resource Manager Stack.
+#
+# Author: Juliano Stefano
+# LinkedIn: https://www.linkedin.com/in/julianostefano/
+# Repository: https://github.com/julianostefano/saddling-up-the-tejo
+#
+# Usage:
+#   1. OCI Console > Developer Services > Resource Manager > Stacks
+#   2. Create Stack > Source Code Control System
+#   3. Repository URL: https://github.com/julianostefano/saddling-up-the-tejo
+#   4. Working Directory: oci/terraform/autonomous-db-23ai
+#   5. Follow UI wizard with this schema
+# ==============================================================================
+
+title: "Oracle Autonomous Database 23ai/26ai with AI Vector Search"
+description: "Deploy Autonomous Database 23ai/26ai with Vector Search, Lakehouse workload, and Application Server for RAG applications"
+schemaVersion: 1.1.0
+version: "1.0.0"
+locale: "en"
+
+# ==============================================================================
+# Variable Groups - Organize UI into logical sections
+# ==============================================================================
+
+variableGroups:
+  - title: "Required Configuration"
+    visible: true
+    variables:
+      - compartment_id
+      - admin_password
+      - ssh_public_key
+
+  - title: "Database Configuration"
+    visible: true
+    variables:
+      - db_name
+      - display_name
+      - db_version
+      - db_workload
+
+  - title: "Always Free Tier Settings"
+    visible: true
+    variables:
+      - is_free_tier
+      - cpu_core_count
+      - data_storage_size_in_tbs
+      - license_model
+
+  - title: "Network Configuration (Existing VCN)"
+    visible: true
+    variables:
+      - vcn_id
+      - public_subnet_id
+      - private_subnet_id
+      - compute_nsg_id
+      - adb_nsg_id
+
+  - title: "Security Configuration"
+    visible: true
+    variables:
+      - is_mtls_connection_required
+      - whitelisted_ips
+
+  - title: "Application Server Configuration"
+    visible: true
+    variables:
+      - compute_shape
+      - compute_display_name
+      - compute_image_id
+
+  - title: "Advanced Options (Paid Tier Only)"
+    visible:
+      not:
+        - is_free_tier
+    variables:
+      - is_auto_scaling_enabled
+      - is_data_guard_enabled
+
+  - title: "Tags (Optional)"
+    visible: true
+    variables:
+      - freeform_tags
+      - defined_tags
+
+# ==============================================================================
+# Variable Definitions with UI Controls
+# ==============================================================================
+
+variables:
+  # ============================================================================
+  # Required Configuration
+  # ============================================================================
+
+  compartment_id:
+    type: oci:identity:compartment:id
+    required: true
+    title: "Compartment"
+    description: "Select the compartment where resources will be created"
+
+  admin_password:
+    type: password
+    required: true
+    title: "Database Admin Password"
+    description: "Password for the ADMIN user (12-30 characters, must include uppercase, lowercase, number)"
+    minLength: 12
+    maxLength: 30
+    pattern: "^[A-Za-z0-9#_@!$%^&*()+=\\-]{12,30}$"
+    confirmation: true
+
+  ssh_public_key:
+    type: oci:core:ssh:publickey
+    required: true
+    title: "SSH Public Key"
+    description: "Public SSH key for application server access (paste contents of id_rsa.pub)"
+    pattern: "^ssh-(rsa|ed25519|ecdsa)"
+
+  # ============================================================================
+  # Database Configuration
+  # ============================================================================
+
+  db_name:
+    type: string
+    required: true
+    title: "Database Name"
+    description: "Alphanumeric name for the database (max 14 chars, must start with letter)"
+    default: "AILAKE01"
+    minLength: 1
+    maxLength: 14
+    pattern: "^[A-Za-z][A-Za-z0-9]{0,13}$"
+
+  display_name:
+    type: string
+    required: true
+    title: "Display Name"
+    description: "Human-readable name shown in OCI Console"
+    default: "AI Data Lakehouse 26ai"
+
+  db_version:
+    type: enum
+    required: true
+    title: "Database Version"
+    description: "Oracle Database version (23ai/26ai recommended for Vector Search)"
+    default: "26ai"
+    enum:
+      - "19c"
+      - "21c"
+      - "23ai"
+      - "26ai"
+    enumLabels:
+      - "19c - Long-term Support (No Vector Search)"
+      - "21c - Innovation Release"
+      - "23ai - AI/ML with Vector Search"
+      - "26ai - Latest with Lakehouse (Recommended)"
+
+  db_workload:
+    type: enum
+    required: true
+    title: "Workload Type"
+    description: "Database workload optimization"
+    default: "LH"
+    enum:
+      - "OLTP"
+      - "DW"
+      - "AJD"
+      - "APEX"
+      - "LH"
+    enumLabels:
+      - "OLTP - Online Transaction Processing"
+      - "DW - Data Warehouse"
+      - "AJD - Autonomous JSON Database"
+      - "APEX - Application Express"
+      - "LH - Lakehouse (AI/ML optimized, 26ai only)"
+
+  # ============================================================================
+  # Always Free Tier Settings
+  # ============================================================================
+
+  is_free_tier:
+    type: boolean
+    required: true
+    title: "Enable Always Free Tier"
+    description: "Use Always Free resources (1 OCPU, 1 TB storage, no auto-scaling)"
+    default: true
+
+  cpu_core_count:
+    type: integer
+    required: true
+    title: "OCPU Count"
+    description: "Number of OCPUs (Always Free: 1, Paid: 1-128)"
+    default: 1
+    minimum: 1
+    maximum: 128
+    visible:
+      not:
+        - is_free_tier
+
+  data_storage_size_in_tbs:
+    type: integer
+    required: true
+    title: "Storage (TB)"
+    description: "Storage size in terabytes (Always Free: 1, Paid: 1-128)"
+    default: 1
+    minimum: 1
+    maximum: 128
+    visible:
+      not:
+        - is_free_tier
+
+  license_model:
+    type: enum
+    required: true
+    title: "License Model"
+    description: "Database license type"
+    default: "LICENSE_INCLUDED"
+    enum:
+      - "LICENSE_INCLUDED"
+      - "BRING_YOUR_OWN_LICENSE"
+    enumLabels:
+      - "License Included (Required for Always Free)"
+      - "Bring Your Own License (BYOL)"
+
+  # ============================================================================
+  # Network Configuration
+  # ============================================================================
+
+  vcn_id:
+    type: oci:core:vcn:id
+    required: true
+    title: "Virtual Cloud Network (VCN)"
+    description: "Select existing VCN for database and application server deployment"
+    dependsOn:
+      compartmentId: ${compartment_id}
+
+  public_subnet_id:
+    type: oci:core:subnet:id
+    required: true
+    title: "Public Subnet"
+    description: "Public subnet for application server (requires internet access)"
+    dependsOn:
+      compartmentId: ${compartment_id}
+      vcnId: ${vcn_id}
+
+  private_subnet_id:
+    type: oci:core:subnet:id
+    required: true
+    title: "Private Subnet"
+    description: "Private subnet for Autonomous Database"
+    dependsOn:
+      compartmentId: ${compartment_id}
+      vcnId: ${vcn_id}
+
+  compute_nsg_id:
+    type: oci:core:networksecuritygroup:id
+    required: true
+    title: "Compute Network Security Group"
+    description: "NSG for application server (must allow SSH port 22)"
+    dependsOn:
+      compartmentId: ${compartment_id}
+      vcnId: ${vcn_id}
+
+  adb_nsg_id:
+    type: oci:core:networksecuritygroup:id
+    required: true
+    title: "Database Network Security Group"
+    description: "NSG for Autonomous Database (must allow Oracle Net ports 1521-1522)"
+    dependsOn:
+      compartmentId: ${compartment_id}
+      vcnId: ${vcn_id}
+
+  # ============================================================================
+  # Security Configuration
+  # ============================================================================
+
+  is_mtls_connection_required:
+    type: boolean
+    required: true
+    title: "Require Mutual TLS (mTLS)"
+    description: "Require wallet for database connections (more secure, recommended)"
+    default: true
+
+  whitelisted_ips:
+    type: array
+    items:
+      type: string
+      pattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}(\\/([0-9]|[1-2][0-9]|3[0-2]))?$"
+    required: false
+    title: "IP Whitelist (CIDR)"
+    description: "Allowed IP addresses/ranges for database access (empty = allow all)"
+    default: []
+    uniqueItems: true
+
+  # ============================================================================
+  # Application Server Configuration
+  # ============================================================================
+
+  compute_shape:
+    type: enum
+    required: true
+    title: "Application Server Compute Shape"
+    description: "VM shape for application server"
+    default: "VM.Standard.E2.1.Micro"
+    enum:
+      - "VM.Standard.E2.1.Micro"
+      - "VM.Standard.A1.Flex"
+      - "VM.Standard.E3.Flex"
+      - "VM.Standard.E4.Flex"
+    enumLabels:
+      - "VM.Standard.E2.1.Micro - Always Free (AMD, 1 OCPU, 1 GB RAM)"
+      - "VM.Standard.A1.Flex - Always Free (ARM, flexible)"
+      - "VM.Standard.E3.Flex - Paid (AMD, flexible)"
+      - "VM.Standard.E4.Flex - Paid (AMD, flexible)"
+
+  compute_display_name:
+    type: string
+    required: true
+    title: "Application Server Display Name"
+    description: "Name for the application server instance"
+    default: "autonomous-db-app-server"
+
+  compute_image_id:
+    type: oci:core:image:id
+    required: false
+    title: "Application Server Image (Optional)"
+    description: "Leave empty for latest Oracle Linux 8 (recommended)"
+    dependsOn:
+      compartmentId: ${compartment_id}
+
+  # ============================================================================
+  # Advanced Options (Paid Tier)
+  # ============================================================================
+
+  is_auto_scaling_enabled:
+    type: boolean
+    required: false
+    title: "Enable Auto-Scaling"
+    description: "Scale up to 3x base OCPU during high load (NOT available on Always Free)"
+    default: false
+    visible:
+      not:
+        - is_free_tier
+
+  is_data_guard_enabled:
+    type: boolean
+    required: false
+    title: "Enable Autonomous Data Guard"
+    description: "Create standby database for HA/DR (NOT available on Always Free)"
+    default: false
+    visible:
+      not:
+        - is_free_tier
+
+  # ============================================================================
+  # Tags
+  # ============================================================================
+
+  freeform_tags:
+    type: object
+    required: false
+    title: "Free-form Tags"
+    description: "Simple key-value tags for resource organization"
+    default:
+      Project: "OCI-Multicloud-Portfolio"
+      Author: "Juliano Stefano"
+      Environment: "Development"
+      Purpose: "RAG-AI-Chatbot"
+      Phase: "Phase-1-Infrastructure"
+      Repository: "saddling-up-the-tejo"
+
+  defined_tags:
+    type: object
+    required: false
+    title: "Defined Tags"
+    description: "Defined tags (requires tag namespace setup)"
+    default: {}
+
+# ==============================================================================
+# Output Groups
+# ==============================================================================
+
+outputGroups:
+  - title: "Database Information"
+    outputs:
+      - autonomous_database_id
+      - autonomous_database_name
+      - lifecycle_state
+      - service_console_url
+
+  - title: "Connection Information"
+    outputs:
+      - database_connection_string_high
+      - database_connection_string_medium
+      - database_connection_string_low
+
+  - title: "Application Server Information"
+    outputs:
+      - app_server_public_ip
+      - app_server_ssh_command
+
+  - title: "Next Steps"
+    outputs:
+      - next_steps
+      - wallet_download_instructions
+
+# ==============================================================================
+# Output Definitions
+# ==============================================================================
+
+outputs:
+  autonomous_database_id:
+    type: ocid
+    title: "Database OCID"
+    description: "OCID of the Autonomous Database instance"
+
+  autonomous_database_name:
+    type: string
+    title: "Database Name"
+    description: "Database name used in connection strings"
+
+  lifecycle_state:
+    type: string
+    title: "Lifecycle State"
+    description: "Current state of the database (should be AVAILABLE)"
+
+  service_console_url:
+    type: link
+    title: "Service Console URL"
+    description: "URL to access database monitoring and management"
+
+  database_connection_string_high:
+    type: copyableString
+    title: "Connection String (HIGH)"
+    description: "HIGH service level connection string"
+
+  database_connection_string_medium:
+    type: copyableString
+    title: "Connection String (MEDIUM)"
+    description: "MEDIUM service level connection string"
+
+  database_connection_string_low:
+    type: copyableString
+    title: "Connection String (LOW)"
+    description: "LOW service level connection string"
+
+  app_server_public_ip:
+    type: string
+    title: "Application Server Public IP"
+    description: "Public IP address of the application server"
+
+  app_server_ssh_command:
+    type: copyableString
+    title: "SSH Command"
+    description: "Command to SSH into application server"
+
+  next_steps:
+    type: string
+    title: "Next Steps"
+    description: "Instructions for downloading wallet and connecting to database"
+
+  wallet_download_instructions:
+    type: string
+    title: "Wallet Download"
+    description: "Instructions for downloading database wallet"
+
+# ==============================================================================
+# Primary Output Button
+# ==============================================================================
+
+primaryOutputButton: service_console_url

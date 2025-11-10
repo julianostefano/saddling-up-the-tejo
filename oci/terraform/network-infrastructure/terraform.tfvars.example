@@ -1,0 +1,70 @@
+# ==============================================================================
+# Oracle OCI Multicloud Portfolio - Network Infrastructure Variables Example
+# ==============================================================================
+# Purpose: Example variable values for VCN and network infrastructure deployment
+#
+# Usage:
+#   1. Copy this file: cp terraform.tfvars.example terraform.tfvars
+#   2. Edit terraform.tfvars with your actual values
+#   3. Run: terraform apply
+#
+# IMPORTANT: Never commit terraform.tfvars to version control!
+#
+# Author: Juliano Stefano
+# LinkedIn: https://www.linkedin.com/in/julianostefano/
+# Repository: https://github.com/julianostefano/saddling-up-the-tejo
+# ==============================================================================
+
+# ==============================================================================
+# Required Variables
+# ==============================================================================
+
+# Compartment OCID where network resources will be created
+# Find at: OCI Console > Identity & Security > Compartments
+# Or run: oci iam compartment list --compartment-id-in-subtree true
+compartment_id = "ocid1.compartment.oc1..aaaaaaaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# ==============================================================================
+# VCN Configuration
+# ==============================================================================
+
+# VCN CIDR block (default: 10.0.0.0/16 for 65,536 IPs)
+vcn_cidr_block = "10.0.0.0/16"
+
+# VCN display name
+vcn_display_name = "ai-lakehouse-vcn"
+
+# Public subnet CIDR (for compute instances with internet access)
+public_subnet_cidr = "10.0.1.0/24"
+
+# Private subnet CIDR (for Autonomous Database)
+private_subnet_cidr = "10.0.2.0/24"
+
+# ==============================================================================
+# Tags for Organization
+# ==============================================================================
+
+freeform_tags = {
+  "Project"     = "OCI-Multicloud-Portfolio"
+  "Author"      = "Juliano Stefano"
+  "Environment" = "Development"
+  "Purpose"     = "Network-Infrastructure"
+  "Repository"  = "saddling-up-the-tejo"
+}
+
+# Defined tags (requires tag namespace setup in OCI)
+defined_tags = {}
+
+# ==============================================================================
+# Alternative CIDR Configurations
+# ==============================================================================
+
+# Example 1: Use 172.16.0.0/16 range
+# vcn_cidr_block      = "172.16.0.0/16"
+# public_subnet_cidr  = "172.16.1.0/24"
+# private_subnet_cidr = "172.16.2.0/24"
+
+# Example 2: Use 192.168.0.0/16 range
+# vcn_cidr_block      = "192.168.0.0/16"
+# public_subnet_cidr  = "192.168.1.0/24"
+# private_subnet_cidr = "192.168.2.0/24"

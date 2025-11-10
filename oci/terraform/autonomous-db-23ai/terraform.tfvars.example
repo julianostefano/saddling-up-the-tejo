@@ -1,0 +1,233 @@
+# ==============================================================================
+# Oracle OCI Multicloud Portfolio - Terraform Variables Example
+# ==============================================================================
+# Purpose: Example variable values for Autonomous Database 23ai deployment.
+#
+# Usage:
+#   1. Copy this file: cp terraform.tfvars.example terraform.tfvars
+#   2. Edit terraform.tfvars with your actual values
+#   3. Run: terraform plan -var-file="terraform.tfvars"
+#
+# IMPORTANT: Never commit terraform.tfvars to version control!
+#            Add it to .gitignore to prevent credential leaks.
+#
+# Author: Juliano Stefano
+# LinkedIn: https://www.linkedin.com/in/julianostefano/
+# Repository: https://github.com/julianostefano/saddling-up-the-tejo
+# ==============================================================================
+
+# ==============================================================================
+# Required Variables
+# ==============================================================================
+
+# Compartment OCID where resources will be created
+# Find it at: OCI Console > Identity & Security > Compartments
+# Or run: oci iam compartment list --compartment-id-in-subtree true
+compartment_id = "ocid1.compartment.oc1..aaaaaaaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Admin password for the Autonomous Database ADMIN user
+# Requirements:
+# - Between 12 and 30 characters
+# - At least one uppercase letter
+# - At least one lowercase letter
+# - At least one number
+# - Cannot contain "admin"
+# - Cannot contain double quotes
+admin_password = "YourSecurePassword123!"
+
+# ==============================================================================
+# Database Configuration
+# ==============================================================================
+
+# Database name (max 14 characters, alphanumeric, must start with letter)
+# This will be used in connection strings
+db_name = "AILAKE01"
+
+# Display name shown in OCI Console
+display_name = "AI Data Lakehouse 23ai"
+
+# Database version: 19c, 21c, 23ai, or 26ai
+# - 19c: Long-term support, no Vector Search
+# - 21c: Innovation release
+# - 23ai: AI/ML features with Vector Search
+# - 26ai: Latest with enhanced AI/ML and Lakehouse workload (recommended)
+db_version = "23ai"
+
+# Workload type: OLTP, DW, AJD, APEX, or LH
+# For RAG with Vector Search:
+# - 19c/21c/23ai: use DW (Data Warehouse)
+# - 26ai: use LH (Lakehouse) - optimized for AI/ML workloads
+db_workload = "DW"
+
+# ==============================================================================
+# Always Free Tier Configuration
+# ==============================================================================
+
+# Enable Always Free tier (recommended for portfolio/development)
+# Always Free specifications:
+# - 1 OCPU (fixed)
+# - 1 TB storage (fixed)
+# - No auto-scaling
+# - No Data Guard
+is_free_tier = true
+
+# OCPU cores (ignored if is_free_tier = true)
+# For paid tier, set between 1-128
+cpu_core_count = 1
+
+# Storage in TB (ignored if is_free_tier = true)
+# For paid tier, set between 1-128
+data_storage_size_in_tbs = 1
+
+# License model
+# LICENSE_INCLUDED: Oracle provides license (required for Always Free)
+# BRING_YOUR_OWN_LICENSE: Use existing Oracle licenses
+license_model = "LICENSE_INCLUDED"
+
+# ==============================================================================
+# Network and Security Configuration
+# ==============================================================================
+
+# Require mutual TLS (mTLS) for connections
+# true: Requires Oracle Wallet (more secure)
+# false: Allows SQL*Net connections (easier for development)
+is_mtls_connection_required = false
+
+# IP whitelist for database access (CIDR notation)
+# Empty list = allow all IPs (not recommended for production)
+# Example: ["203.0.113.0/24", "198.51.100.5/32"]
+whitelisted_ips = []
+
+# ==============================================================================
+# Network Configuration (from existing VCN)
+# ==============================================================================
+
+# VCN OCID (create VCN via OCI Console Wizard first)
+# Navigate to: Networking > Virtual Cloud Networks > VCN Details
+# Copy the OCID value
+vcn_id = "ocid1.vcn.oc1.sa-vinhedo-1.amaaaaaa..."
+
+# Public Subnet OCID (for application server with internet access)
+# Navigate to: VCN > Subnets > Public Subnet > Details
+# Copy the OCID value
+public_subnet_id = "ocid1.subnet.oc1.sa-vinhedo-1.aaaaaaaaa..."
+
+# Private Subnet OCID (OPTIONAL - not used for public database)
+# Leave empty for public database deployment
+# Only needed if using private endpoint in the future
+private_subnet_id = ""
+
+# Compute NSG OCID (Network Security Group for application server)
+# Navigate to: VCN > Network Security Groups > Compute NSG > Details
+# Copy the OCID value
+compute_nsg_id = "ocid1.networksecuritygroup.oc1.sa-vinhedo-1.aaaaaaaaa..."
+
+# Database NSG OCID (OPTIONAL - not used for public database)
+# Leave empty - database is PUBLIC and accessible from anywhere
+# Access control via mTLS (wallet) and IP whitelist only
+adb_nsg_id = ""
+
+# ==============================================================================
+# Compute Instance Configuration (Application Server)
+# ==============================================================================
+
+# SSH public key for application server access
+# Generate with: ssh-keygen -t rsa -b 4096 -C "your_email@example.com"
+# Then copy the content of: cat ~/.ssh/id_rsa.pub
+ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ... your_email@example.com"
+
+# Compute shape (Always Free tier)
+# VM.Standard.E2.1.Micro: AMD, 1 OCPU, 1 GB RAM (Always Free)
+# VM.Standard.A1.Flex: ARM Ampere (Always Free, flexible)
+compute_shape = "VM.Standard.E2.1.Micro"
+
+# Application server display name
+compute_display_name = "autonomous-db-app-server"
+
+# Compute image OCID (leave empty for latest Oracle Linux 8)
+# Empty = auto-select latest Oracle Linux 8 image
+# Or specify custom image OCID
+compute_image_id = ""
+
+# ==============================================================================
+# Tags for Organization
+# ==============================================================================
+
+# Free-form tags for resource tracking
+freeform_tags = {
+  "Project"     = "OCI-Multicloud-Portfolio"
+  "Author"      = "Juliano Stefano"
+  "Environment" = "Development"
+  "Purpose"     = "RAG-AI-Chatbot"
+  "Phase"       = "Phase-1-Infrastructure"
+  "Repository"  = "saddling-up-the-tejo"
+}
+
+# Defined tags (requires tag namespace setup in OCI)
+# Example:
+# defined_tags = {
+#   "Operations.CostCenter" = "42"
+#   "Security.Compliance"   = "PCI-DSS"
+# }
+defined_tags = {}
+
+# ==============================================================================
+# Optional Features (NOT available on Always Free tier)
+# ==============================================================================
+
+# Auto-scaling: scales up to 3x base OCPU during high load
+# Only available if is_free_tier = false
+is_auto_scaling_enabled = false
+
+# Autonomous Data Guard: creates standby database for HA/DR
+# Only available if is_free_tier = false
+is_data_guard_enabled = false
+
+# ==============================================================================
+# Version-Specific Configuration Examples
+# ==============================================================================
+
+# Example 1: Oracle Database 19c (Long-term Support)
+# db_version  = "19c"
+# db_workload = "DW"
+
+# Example 2: Oracle Database 23ai with Vector Search
+# db_version  = "23ai"
+# db_workload = "DW"
+
+# Example 3: Oracle Database 26ai with Lakehouse (Recommended for RAG)
+# db_version  = "26ai"
+# db_workload = "LH"
+
+# ==============================================================================
+# Production Configuration Example (Commented Out)
+# ==============================================================================
+
+# Uncomment and modify for production deployments:
+
+# is_free_tier                 = false
+# cpu_core_count               = 4
+# data_storage_size_in_tbs     = 2
+# is_mtls_connection_required  = true
+# is_auto_scaling_enabled      = true
+# is_data_guard_enabled        = true
+# license_model                = "BRING_YOUR_OWN_LICENSE"
+
+# whitelisted_ips = [
+#   "203.0.113.0/24",    # Corporate network
+#   "198.51.100.5/32",   # Specific application server
+# ]
+
+# freeform_tags = {
+#   "Project"     = "Production-AI-Platform"
+#   "Author"      = "Juliano Stefano"
+#   "Environment" = "Production"
+#   "Purpose"     = "Enterprise-RAG-System"
+#   "CostCenter"  = "IT-Database-Services"
+# }
+
+# defined_tags = {
+#   "Operations.CostCenter" = "42"
+#   "Security.Compliance"   = "PCI-DSS"
+#   "Operations.Owner"      = "database-team"
+# }

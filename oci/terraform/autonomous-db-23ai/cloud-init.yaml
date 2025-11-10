@@ -1,0 +1,85 @@
+#cloud-config
+# ==============================================================================
+# Cloud-Init Configuration for Application Server
+# ==============================================================================
+# Purpose: Initialize VM with Oracle Instant Client, Bun runtime, tools, and
+#          configurations for running applications and accessing Autonomous Database.
+#
+# Author: Juliano Stefano
+# LinkedIn: https://www.linkedin.com/in/julianostefano/
+# ==============================================================================
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - wget
+  - curl
+  - vim
+  - git
+  - unzip
+  - python3
+  - python3-pip
+  - oracle-release-el8
+
+runcmd:
+  # Update system
+  - yum update -y
+
+  # Install Oracle Instant Client
+  - yum install -y oracle-instantclient-release-el8
+  - yum install -y oracle-instantclient-basic oracle-instantclient-sqlplus oracle-instantclient-tools
+
+  # Set environment variables for Oracle Instant Client
+  - echo 'export LD_LIBRARY_PATH=/usr/lib/oracle/21/client64/lib:$LD_LIBRARY_PATH' >> /etc/profile.d/oracle.sh
+  - echo 'export PATH=/usr/lib/oracle/21/client64/bin:$PATH' >> /etc/profile.d/oracle.sh
+  - chmod +x /etc/profile.d/oracle.sh
+  - source /etc/profile.d/oracle.sh
+
+  # Install Python Oracle DB driver
+  - pip3 install oracledb
+
+  # Create directory for wallets (if needed for mTLS)
+  - mkdir -p /opt/oracle/wallet
+  - chmod 755 /opt/oracle/wallet
+
+  # Create welcome message
+  - |
+    cat > /etc/motd << 'EOF'
+
+    ================================================================================
+    Oracle Autonomous Database - Application Server
+    ================================================================================
+
+    Author: Juliano Stefano
+    LinkedIn: https://www.linkedin.com/in/julianostefano/
+
+    This application server is configured for running Bun applications and
+    accessing Autonomous Database 23ai/26ai with Oracle Instant Client and
+    Python oracledb driver.
+
+    Tools installed:
+    - Oracle Instant Client (Basic, SQL*Plus, Tools)
+    - Python 3 with oracledb driver
+    - Git, wget, curl, vim
+
+    Database Connection (requires wallet for mTLS):
+    ------------------------------------------------
+    sqlplus admin/<password>@${db_name}_high
+
+    Test connection:
+    ----------------
+    SELECT banner FROM v$version;
+
+    Documentation: See project README.md
+    ================================================================================
+
+    EOF
+
+  # Set correct ownership
+  - chown -R opc:opc /opt/oracle
+
+final_message: |
+  Application server setup complete!
+  Oracle Instant Client is installed and ready to use.
+  Connect to database with: sqlplus admin/<password>@${db_name}_high
