@@ -1,6 +1,6 @@
 # Saddling Up the Tejo
 
-**Oracle Multicloud Database Portfolio** - Production-ready code examples demonstrating advanced Oracle Database, OCI, and multicloud expertise.
+**Multicloud Database Portfolio** - Production-ready code examples demonstrating advanced Oracle Database, OCI, and multicloud expertise.
 
 **Author:** Juliano Stefano
 **LinkedIn:** [linkedin.com/in/julianostefano](https://www.linkedin.com/in/julianostefano/)
@@ -194,10 +194,6 @@ This project follows enterprise development standards:
 - **TypeScript:** Google TypeScript Style Guide, strict mode
 - **SQL/PL-SQL:** Trivadis Coding Guidelines v4.5
 - **Documentation:** Clear, concise, bilingual where applicable
-- **No Emojis:** Professional code and documentation only
-
-See [CLAUDE.md](./CLAUDE.md) for complete development guidelines.
-
 ---
 
 ## Roadmap
