@@ -85,8 +85,6 @@ Enterprise Exadata deployments across cloud providers:
 saddling-up-the-tejo/
 ├── README.md                 # This file
 ├── LICENSE                   # MIT License
-├── CLAUDE.md                 # Development guidelines for Claude Code
-│
 ├── oci/
 │   └── terraform/
 │       └── autonomous-db-23ai/
