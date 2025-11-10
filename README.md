@@ -1,6 +1,6 @@
 # Saddling Up the Tejo
 
-**Multicloud Database Portfolio** - Production-ready code examples demonstrating advanced Oracle Database, OCI, and multicloud expertise.
+**Multicloud Database Portfolio** - Code examples demonstrating advanced Oracle Database, OCI, and multicloud expertise.
 
 **Author:** Juliano Stefano
 **LinkedIn:** [linkedin.com/in/julianostefano](https://www.linkedin.com/in/julianostefano/)
