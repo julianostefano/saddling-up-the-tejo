@@ -219,9 +219,8 @@ MIT License - see [LICENSE](./LICENSE) for details.
 ## Contact
 
 **Juliano Stefano**
-Principal DBA | Cloud Solutions Architect
+Oracle DBA Expert & Multi-Cloud Architect | Cloud Solutions Architect
 LinkedIn: [linkedin.com/in/julianostefano](https://www.linkedin.com/in/julianostefano/)
-Email: jsdealencar@ayesa.com
 
 ---
 
