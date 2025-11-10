@@ -55,7 +55,7 @@ Python-based Retrieval-Augmented Generation (RAG) system:
 
 ### Phase 3: Bun/Elysia Chatbot + MCP Agents (Planned)
 **Status:** Planned
-**Location:** `bun/chatbot-mcp/` (coming soon)
+**Location:** `bun/chatbot/` (coming soon)
 
 Modern TypeScript chatbot with Model Context Protocol integration:
 
