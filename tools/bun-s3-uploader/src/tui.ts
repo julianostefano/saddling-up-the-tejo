@@ -22,12 +22,22 @@ import {
   resolveTargetEndpointOrigin,
   validateAndResolveAuth,
 } from "./env.ts";
-import { listDirectoryEntriesWithShell, type DirectoryEntry } from "./shell.ts";
-import { executeS3Upload } from "./uploader.ts";
+import {
+  listDirectoryEntriesWithShell,
+  resolveUploadTargets,
+  type DirectoryEntry,
+} from "./shell.ts";
+import { executeBatchUpload, executeS3Upload } from "./uploader.ts";
 import type {
+  BatchUploadReport,
   CliOptions,
   FileAnalysis,
+  OverwriteDecision,
+  OverwritePolicy,
+  OverwritePromptInfo,
   ProgressSnapshot,
+  ResolvedUploadTarget,
+  UploadCallbacks,
   UploadReport,
   VerifyMode,
 } from "./types.ts";
@@ -45,12 +55,11 @@ const ANSI = {
   green: "\x1b[32m",
   yellow: "\x1b[33m",
   red: "\x1b[31m",
-  magenta: "\x1b[35m",
   inverse: "\x1b[7m",
 };
 
 interface TuiState {
-  screen: "config" | "browse" | "running" | "summary";
+  screen: "config" | "browse" | "running" | "confirm-overwrite" | "summary";
   selectedField: number;
   editingText: boolean;
   editBuffer: string;
@@ -63,6 +72,7 @@ interface TuiState {
   partSizeMiB: number;
   queueSize: number;
   verifyMode: VerifyMode;
+  overwritePolicy: OverwritePolicy;
   allowInvalidCerts: boolean;
   linkSpeedMbps: number;
 
@@ -70,16 +80,21 @@ interface TuiState {
   browseEntries: DirectoryEntry[];
   browseIndex: number;
 
+  batchIndex?: number;
+  batchTotal?: number;
+  currentTarget?: ResolvedUploadTarget;
   analysis?: FileAnalysis;
-  latestProgress?: ProgressSnapshot;
   phaseSnapshots: Partial<Record<ProgressSnapshot["phase"], ProgressSnapshot>>;
   logs: Array<{ level: string; text: string }>;
+  pendingOverwrite?: OverwritePromptInfo;
   report?: UploadReport;
+  batchReport?: BatchUploadReport;
   errorText?: string;
 }
 
 const PART_SIZE_CHOICES = [5, 10, 16, 32, 64];
 const VERIFY_CHOICES: VerifyMode[] = ["full", "stat", "none"];
+const OVERWRITE_CHOICES: OverwritePolicy[] = ["ask", "skip", "overwrite"];
 
 function padRight(text: string, width: number): string {
   if (text.length >= width) return text.slice(0, width);
@@ -87,7 +102,7 @@ function padRight(text: string, width: number): string {
 }
 
 function renderScreen(state: TuiState): void {
-  const cols = Math.max(72, Math.min(110, process.stdout.columns || 96));
+  const cols = Math.max(74, Math.min(114, process.stdout.columns || 96));
   const inner = cols - 4;
   const line = "─".repeat(cols - 2);
   const out: string[] = [ANSI.clear];
@@ -101,23 +116,23 @@ function renderScreen(state: TuiState): void {
   out.push(`├${line}┤`);
 
   if (state.screen === "config") {
-    const fields: Array<{ label: string; value: string; kind: "text" | "toggle" | "cycle" }> = [
-      { label: "File Path", value: state.filePath || "(empty - press B to browse)", kind: "text" },
-      { label: "Destination Bucket", value: state.bucket || "(uses S3_BUCKET/AWS_BUCKET)", kind: "text" },
-      { label: "Object Key", value: state.key || "(auto: file basename)", kind: "text" },
-      { label: "Endpoint URL", value: state.endpoint || "(uses env or AWS default)", kind: "text" },
-      { label: "AWS Region", value: state.region || "us-east-1", kind: "text" },
-      { label: "Multipart Size", value: `${state.partSizeMiB} MiB`, kind: "cycle" },
-      { label: "Concurrency", value: `${state.queueSize} parallel parts`, kind: "cycle" },
-      { label: "Shasum Verify", value: state.verifyMode, kind: "cycle" },
+    const fields: Array<{ label: string; value: string }> = [
+      { label: "Path / Dir / Glob", value: state.filePath || "(empty - press B to browse or enter *.glob / dir)" },
+      { label: "Destination Bucket", value: state.bucket || "(uses S3_BUCKET/AWS_BUCKET)" },
+      { label: "Key / Prefix", value: state.key || "(auto: filename or relative path)" },
+      { label: "Endpoint URL", value: state.endpoint || "(uses env or AWS default)" },
+      { label: "AWS Region", value: state.region || "us-east-1" },
+      { label: "Multipart Size", value: `${state.partSizeMiB} MiB` },
+      { label: "Concurrency", value: `${state.queueSize} parallel parts` },
+      { label: "Shasum Verify", value: state.verifyMode },
+      { label: "Overwrite Policy", value: state.overwritePolicy },
       {
         label: "Allow Invalid TLS",
         value: state.allowInvalidCerts ? "[ENABLED] (NODE_TLS_REJECT_UNAUTHORIZED=0)" : "[DISABLED] (strict TLS)",
-        kind: "toggle",
       },
     ];
 
-    boxLine(`${ANSI.bold}Configuration${ANSI.reset}  (Up/Down: select, Enter: edit/toggle, B: browse files, S: start upload, Q: quit)`);
+    boxLine(`${ANSI.bold}Configuration${ANSI.reset}  (Up/Down: select, Enter: edit/toggle, B: browse, S: start, Q: quit)`);
     boxLine("");
 
     for (let i = 0; i < fields.length; i++) {
@@ -149,7 +164,7 @@ function renderScreen(state: TuiState): void {
       }
     }
   } else if (state.screen === "browse") {
-    boxLine(`${ANSI.bold}Bun Shell File Browser ($ ls -l)${ANSI.reset}  (Up/Down: move, Enter: open/select, Backspace: parent, Esc: back)`);
+    boxLine(`${ANSI.bold}Bun Shell File Browser ($ ls -l)${ANSI.reset}  (Enter: open/select, U: use current dir, Esc: back)`);
     boxLine(`Directory: ${state.browseDir}`);
     out.push(`├${line}┤`);
 
@@ -171,8 +186,19 @@ function renderScreen(state: TuiState): void {
         out.push(`│ ${prefix}${padRight(row, inner - 2)}${ANSI.reset}`);
       }
     }
-  } else if (state.screen === "running" || state.screen === "summary") {
-    boxLine(`${ANSI.bold}Transfer Dashboard${ANSI.reset}`);
+  } else if (
+    state.screen === "running" ||
+    state.screen === "confirm-overwrite" ||
+    state.screen === "summary"
+  ) {
+    const batchTag =
+      state.batchTotal && state.batchTotal > 1 && state.batchIndex !== undefined
+        ? ` [File ${state.batchIndex}/${state.batchTotal}]`
+        : "";
+    boxLine(`${ANSI.bold}Transfer Dashboard${batchTag}${ANSI.reset}`);
+    if (state.currentTarget) {
+      boxLine(`Key: ${state.currentTarget.objectKey}`);
+    }
     if (state.analysis) {
       boxLine(`File: ${state.analysis.fileName} (${formatBytes(state.analysis.sizeBytes)}) | Type: ${state.analysis.mimeType}`);
       boxLine(`Strategy: ${state.analysis.reason}`);
@@ -194,11 +220,23 @@ function renderScreen(state: TuiState): void {
         const speed = formatSpeed(snap.speedBytesPerSec);
         const bw = `${formatBandwidth(snap.bandwidthMbps)} (${snap.bandwidthUtilizationPct.toFixed(1)}%)`;
         const eta = formatEta(snap.etaSeconds);
-        const part = snap.totalParts && snap.totalParts > 1 && snap.currentPart !== undefined
-          ? ` [Part ${snap.currentPart}/${snap.totalParts}]`
-          : "";
+        const part =
+          snap.totalParts && snap.totalParts > 1 && snap.currentPart !== undefined
+            ? ` [Part ${snap.currentPart}/${snap.totalParts}]`
+            : "";
         out.push(`│ ${ANSI.cyan}${p.title}${ANSI.reset} ${bar} ${speed} | BW ${bw} | ETA ${eta}${part}`);
       }
+    }
+
+    if (state.screen === "confirm-overwrite" && state.pendingOverwrite) {
+      const ov = state.pendingOverwrite;
+      out.push(`├${line}┤`);
+      out.push(`│ ${ANSI.yellow}${ANSI.bold}OVERWRITE CONFIRMATION REQUIRED${ANSI.reset}`);
+      boxLine(`Target Object: s3://${ov.bucket}/${ov.key}`);
+      boxLine(
+        `Local Size: ${formatBytes(ov.localSizeBytes)} | Remote Size: ${ov.remoteSizeBytes !== undefined ? formatBytes(ov.remoteSizeBytes) : "unknown"}${ov.remoteEtag ? ` | ETag: ${ov.remoteEtag}` : ""}`,
+      );
+      out.push(`│ ${ANSI.bold}Press [Y]es, [N]o (skip), [A]ll (overwrite all), [S]kip all, or [Q]uit${ANSI.reset}`);
     }
 
     if (state.logs.length > 0) {
@@ -219,7 +257,20 @@ function renderScreen(state: TuiState): void {
 
     if (state.screen === "summary") {
       out.push(`├${line}┤`);
-      if (state.report?.success) {
+      if (state.batchReport) {
+        const b = state.batchReport;
+        const headingColor = b.success ? ANSI.green : ANSI.red;
+        out.push(`│ ${headingColor}${ANSI.bold}BATCH TRANSFER ${b.success ? "COMPLETED" : "FINISHED WITH ERRORS"}${ANSI.reset}`);
+        boxLine(`Bucket:        s3://${b.bucket}`);
+        boxLine(`Files:         ${b.totalFiles} total | ${b.uploadedCount} uploaded | ${b.skippedCount} skipped | ${b.failedCount} failed`);
+        boxLine(`Total Volume:  ${formatBytes(b.uploadedBytes)} / ${formatBytes(b.totalBytes)} in ${formatDurationMs(b.durationMs)}`);
+        boxLine(`Avg Speed/BW:  ${formatSpeed(b.avgSpeedBytesPerSec)} | ${formatBandwidth(b.avgBandwidthMbps)}`);
+      } else if (state.report?.skipped) {
+        const r = state.report;
+        out.push(`│ ${ANSI.yellow}${ANSI.bold}UPLOAD SKIPPED${ANSI.reset}`);
+        boxLine(`Target:  s3://${r.bucket}/${r.key}`);
+        boxLine(`Reason:  ${r.skipReason ?? "Skipped"}`);
+      } else if (state.report?.success) {
         const r = state.report;
         out.push(`│ ${ANSI.green}${ANSI.bold}UPLOAD & VERIFICATION SUCCEEDED${ANSI.reset}`);
         boxLine(`Target:          s3://${r.bucket}/${r.key}`);
@@ -250,7 +301,7 @@ function renderScreen(state: TuiState): void {
 }
 
 /**
- * Runs the interactive Terminal UI using exclusively native Bun APIs (`process.stdin`, ANSI, `$`).
+ * Runs the interactive Terminal UI using exclusively native Bun APIs (`process.stdin`, ANSI, `$`, `Bun.Glob`).
  */
 export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<number> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
@@ -271,6 +322,7 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
     partSizeMiB: Math.max(5, Math.round((initialOptions.partSize ?? DEFAULT_PART_SIZE) / MIB)),
     queueSize: initialOptions.queueSize ?? DEFAULT_QUEUE_SIZE,
     verifyMode: initialOptions.verifyMode ?? "full",
+    overwritePolicy: initialOptions.overwritePolicy ?? "ask",
     allowInvalidCerts:
       initialOptions.insecure ?? process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0",
     linkSpeedMbps: initialOptions.linkSpeedMbps ?? DEFAULT_LINK_SPEED_MBPS,
@@ -283,6 +335,7 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
 
   let running = true;
   let exitCode = 0;
+  let overwriteResolver: ((decision: OverwriteDecision) => void) | null = null;
 
   const restoreTerminal = () => {
     try {
@@ -302,7 +355,11 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
   const startUpload = async () => {
     state.errorText = undefined;
     state.report = undefined;
+    state.batchReport = undefined;
     state.analysis = undefined;
+    state.currentTarget = undefined;
+    state.batchIndex = undefined;
+    state.batchTotal = undefined;
     state.phaseSnapshots = {};
     state.logs = [];
 
@@ -317,6 +374,7 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
       queueSize: state.queueSize,
       retry: DEFAULT_RETRY,
       verifyMode: state.verifyMode,
+      overwritePolicy: state.overwritePolicy,
       linkSpeedMbps: state.linkSpeedMbps,
       insecure: state.allowInvalidCerts,
       strictTls: !state.allowInvalidCerts,
@@ -329,7 +387,7 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
     };
 
     if (!cliOpts.filePath) {
-      state.errorText = "Please enter or browse for a File Path before starting upload.";
+      state.errorText = "Please enter a File, Directory, or Wildcard pattern (or press B to browse).";
       renderScreen(state);
       return;
     }
@@ -337,6 +395,15 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
     const validation = validateAndResolveAuth(cliOpts);
     if (!validation.valid || !validation.auth) {
       state.errorText = formatMissingConfigError(validation.missing);
+      renderScreen(state);
+      return;
+    }
+
+    let targets: ResolvedUploadTarget[];
+    try {
+      targets = await resolveUploadTargets([cliOpts.filePath], cliOpts.key);
+    } catch (err) {
+      state.errorText = err instanceof Error ? err.message : String(err);
       renderScreen(state);
       return;
     }
@@ -349,7 +416,7 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
     state.screen = "running";
     state.logs.push({
       level: "info",
-      text: `Target: s3://${auth.bucket}/${cliOpts.key || cliOpts.filePath} via ${targetOrigin}`,
+      text: `Matched ${targets.length} file(s) -> s3://${auth.bucket} via ${targetOrigin}`,
     });
     if (proxy.activeProxyUrl) {
       state.logs.push({
@@ -364,30 +431,65 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
     renderScreen(state);
 
     let lastRenderMs = 0;
-    try {
-      const report = await executeS3Upload(cliOpts, auth, proxy, tls, {
-        onAnalysis: (analysis) => {
-          state.analysis = analysis;
-          state.logs.push({ level: "info", text: analysis.reason });
+    const callbacks: UploadCallbacks = {
+      onTargetStart: (idx, total, target) => {
+        state.batchIndex = idx;
+        state.batchTotal = total;
+        state.currentTarget = target;
+        state.phaseSnapshots = {};
+        state.analysis = undefined;
+        renderScreen(state);
+      },
+      onAnalysis: (analysis) => {
+        state.analysis = analysis;
+        state.logs.push({ level: "info", text: analysis.reason });
+        renderScreen(state);
+      },
+      onLog: (level, msg) => {
+        state.logs.push({ level, text: msg });
+        renderScreen(state);
+      },
+      onProgress: (snap) => {
+        state.phaseSnapshots[snap.phase] = snap;
+        const now = performance.now();
+        if (now - lastRenderMs >= 80 || snap.percent >= 100) {
+          lastRenderMs = now;
           renderScreen(state);
-        },
-        onLog: (level, msg) => {
-          state.logs.push({ level, text: msg });
-          renderScreen(state);
-        },
-        onProgress: (snap) => {
-          state.latestProgress = snap;
-          state.phaseSnapshots[snap.phase] = snap;
-          const now = performance.now();
-          if (now - lastRenderMs >= 80 || snap.percent >= 100) {
-            lastRenderMs = now;
+        }
+      },
+      confirmOverwrite: async (info) => {
+        state.pendingOverwrite = info;
+        state.screen = "confirm-overwrite";
+        renderScreen(state);
+        return await new Promise<OverwriteDecision>((resolveDecision) => {
+          overwriteResolver = (decision) => {
+            overwriteResolver = null;
+            state.pendingOverwrite = undefined;
+            state.screen = "running";
             renderScreen(state);
-          }
-        },
-      });
-      state.report = report;
-      state.screen = "summary";
-      exitCode = report.success ? 0 : 1;
+            resolveDecision(decision);
+          };
+        });
+      },
+    };
+
+    try {
+      if (targets.length === 1) {
+        const singleOpts: CliOptions = {
+          ...cliOpts,
+          filePath: targets[0]!.localPath,
+          key: targets[0]!.objectKey,
+        };
+        const report = await executeS3Upload(singleOpts, auth, proxy, tls, callbacks);
+        state.report = report;
+        state.screen = "summary";
+        exitCode = report.success ? 0 : 1;
+      } else {
+        const batchReport = await executeBatchUpload(targets, cliOpts, auth, proxy, tls, callbacks);
+        state.batchReport = batchReport;
+        state.screen = "summary";
+        exitCode = batchReport.success ? 0 : 1;
+      }
       renderScreen(state);
     } catch (err) {
       state.errorText = err instanceof Error ? err.message : String(err);
@@ -411,11 +513,21 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
       const onData = async (chunk: Buffer) => {
         const key = chunk.toString("utf8");
 
-        // Ctrl+C always exits cleanly
         if (key === "\x03") {
+          overwriteResolver?.("abort");
           running = false;
           process.stdin.off("data", onData);
           resolveLoop();
+          return;
+        }
+
+        if (state.screen === "confirm-overwrite" && overwriteResolver) {
+          const lower = key.toLowerCase();
+          if (lower === "y") overwriteResolver("overwrite");
+          else if (lower === "n" || key === "\r" || key === "\n") overwriteResolver("skip");
+          else if (lower === "a") overwriteResolver("overwrite-all");
+          else if (lower === "s") overwriteResolver("skip-all");
+          else if (lower === "q") overwriteResolver("abort");
           return;
         }
 
@@ -439,6 +551,12 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
 
         if (state.screen === "browse") {
           if (key === "\x1b" || key === "q" || key === "Q") {
+            state.screen = "config";
+            renderScreen(state);
+            return;
+          }
+          if (key === "u" || key === "U") {
+            state.filePath = state.browseDir;
             state.screen = "config";
             renderScreen(state);
             return;
@@ -521,13 +639,14 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
           await startUpload();
           return;
         }
+        const totalFields = 10;
         if (key === "\x1b[A") {
-          state.selectedField = (state.selectedField + 8) % 9;
+          state.selectedField = (state.selectedField + totalFields - 1) % totalFields;
           renderScreen(state);
           return;
         }
         if (key === "\x1b[B") {
-          state.selectedField = (state.selectedField + 1) % 9;
+          state.selectedField = (state.selectedField + 1) % totalFields;
           renderScreen(state);
           return;
         }
@@ -558,6 +677,10 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
             state.verifyMode = VERIFY_CHOICES[(idx + 1) % VERIFY_CHOICES.length]!;
             renderScreen(state);
           } else if (state.selectedField === 8) {
+            const idx = OVERWRITE_CHOICES.indexOf(state.overwritePolicy);
+            state.overwritePolicy = OVERWRITE_CHOICES[(idx + 1) % OVERWRITE_CHOICES.length]!;
+            renderScreen(state);
+          } else if (state.selectedField === 9) {
             state.allowInvalidCerts = !state.allowInvalidCerts;
             renderScreen(state);
           }

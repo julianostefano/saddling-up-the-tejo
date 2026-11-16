@@ -1,7 +1,9 @@
-import { executeS3Upload } from "./uploader.ts";
+import { executeBatchUpload, executeS3Upload } from "./uploader.ts";
 import type {
+  BatchUploadReport,
   CliOptions,
   ProxyConfig,
+  ResolvedUploadTarget,
   S3AuthConfig,
   TlsConfig,
   UploadCallbacks,
@@ -23,4 +25,18 @@ export async function runInGraph(
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
   }
   return await executeS3Upload(options, auth, proxy, tls, callbacks);
+}
+
+export async function runBatchInGraph(
+  targets: ResolvedUploadTarget[],
+  options: CliOptions,
+  auth: S3AuthConfig,
+  proxy: ProxyConfig,
+  tls: TlsConfig,
+  callbacks: UploadCallbacks,
+): Promise<BatchUploadReport> {
+  if (tls.allowInvalidCerts) {
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+  }
+  return await executeBatchUpload(targets, options, auth, proxy, tls, callbacks);
 }

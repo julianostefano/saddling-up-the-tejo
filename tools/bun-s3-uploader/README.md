@@ -11,6 +11,8 @@ A zero-runtime-dependency S3 upload **CLI** and **TUI** built exclusively with *
 ## Features
 
 - Reads credentials from `S3_*` or `AWS_*` environment variables and reports all missing variables/parameters clearly in English.
+- Supports single files, recursive directories, and wildcard glob patterns (`*.log`, `dist/**/*`) via `Bun.Glob`.
+- Checks if destination S3 objects already exist and requests confirmation before overwriting (`[y]es / [N]o / [a]ll / [s]kip all / [q]uit`), with `--yes`/`--overwrite` and `--skip-existing` flags for automation.
 - Analyzes local file size before uploading and automatically selects Single-Part or Multipart Upload (`>= 5 MiB` default threshold), informing the user of the chosen strategy and part count.
 - Displays live **Progress (%)**, **ETA**, **Upload Speed**, **Download/Readback Speed** (during `full` SHA-256 verification), **Bandwidth utilization (`Mbps` & `%`)**, and **SHA-256 / ETag / Size** validation.
 - Honors `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` (or `--proxy <url>`).

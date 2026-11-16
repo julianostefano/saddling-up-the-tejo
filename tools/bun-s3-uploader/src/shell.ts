@@ -1,6 +1,7 @@
-import { $ } from "bun";
+import { $, Glob } from "bun";
 import { resolve, basename, dirname } from "node:path";
 import { statSync } from "node:fs";
+import type { ResolvedUploadTarget } from "./types.ts";
 
 export interface ShellPathInspection {
   exists: boolean;
@@ -124,4 +125,160 @@ export async function runTypeCheckWithShell(projectRoot: string): Promise<{
     .quiet();
   const output = [res.stdout.toString(), res.stderr.toString()].filter(Boolean).join("\n").trim();
   return { exitCode: res.exitCode, output };
+}
+
+const GLOB_META_REGEX = /[*?\[\{]/;
+
+/**
+ * Returns true if the input string contains wildcard/glob metacharacters (`*`, `?`, `[`, `{`).
+ */
+export function hasGlobPattern(input: string): boolean {
+  return GLOB_META_REGEX.test(input);
+}
+
+function normalizeSlashes(p: string): string {
+  return p.replace(/\\/g, "/");
+}
+
+function splitGlobBaseAndPattern(rawInput: string): { baseDir: string; pattern: string } {
+  const normalized = normalizeSlashes(rawInput.trim());
+  const segments = normalized.split("/");
+  const firstGlobIdx = segments.findIndex((seg) => GLOB_META_REGEX.test(seg));
+
+  if (firstGlobIdx === -1) {
+    return { baseDir: resolve(rawInput), pattern: "**/*" };
+  }
+
+  const prefixSegments = segments.slice(0, firstGlobIdx);
+  const patternSegments = segments.slice(firstGlobIdx);
+  let baseDirStr = prefixSegments.join("/");
+
+  if (!baseDirStr) {
+    baseDirStr = normalized.startsWith("/") ? "/" : ".";
+  } else if (/^[a-zA-Z]:$/.test(baseDirStr)) {
+    // Windows drive letter root like "C:" -> "C:/"
+    baseDirStr += "/";
+  }
+
+  return {
+    baseDir: resolve(baseDirStr),
+    pattern: patternSegments.join("/") || "*",
+  };
+}
+
+function joinObjectKey(prefix: string | undefined, relativeKey: string): string {
+  const cleanRel = normalizeSlashes(relativeKey).replace(/^\/+/, "");
+  if (!prefix || !prefix.trim()) {
+    return cleanRel;
+  }
+  const cleanPrefix = normalizeSlashes(prefix.trim()).replace(/^\/+|\/+$/g, "");
+  return cleanPrefix ? `${cleanPrefix}/${cleanRel}` : cleanRel;
+}
+
+/**
+ * Resolves one or more local inputs (single file, recursive directory, or wildcard glob pattern)
+ * into a deduplicated list of upload targets with deterministic S3 object keys.
+ */
+export async function resolveUploadTargets(
+  inputs: string[],
+  keyOrPrefix?: string,
+  options: { includeHidden?: boolean } = {},
+): Promise<ResolvedUploadTarget[]> {
+  if (inputs.length === 0) {
+    throw new Error("At least one input file, directory, or wildcard pattern is required.");
+  }
+
+  const seenPaths = new Set<string>();
+  const targets: ResolvedUploadTarget[] = [];
+  const includeHidden = Boolean(options.includeHidden);
+  const isSingleLiteralInput =
+    inputs.length === 1 && !hasGlobPattern(inputs[0]!);
+
+  for (const rawInput of inputs) {
+    if (hasGlobPattern(rawInput)) {
+      const { baseDir, pattern } = splitGlobBaseAndPattern(rawInput);
+      const glob = new Glob(pattern);
+      let matchCount = 0;
+
+      for await (const relMatch of glob.scan({
+        cwd: baseDir,
+        onlyFiles: true,
+        dot: includeHidden,
+      })) {
+        const absFile = resolve(baseDir, relMatch);
+        if (seenPaths.has(absFile)) continue;
+        seenPaths.add(absFile);
+        matchCount++;
+
+        const normalizedRel = normalizeSlashes(relMatch);
+        targets.push({
+          localPath: absFile,
+          relativePath: normalizedRel,
+          objectKey: joinObjectKey(keyOrPrefix, normalizedRel),
+          sizeBytes: Bun.file(absFile).size,
+        });
+      }
+
+      if (matchCount === 0) {
+        throw new Error(`No files matched wildcard pattern "${rawInput}" (base: "${baseDir}").`);
+      }
+      continue;
+    }
+
+    const inspection = await inspectLocalPathWithShell(rawInput);
+    if (!inspection.exists) {
+      throw new Error(`Input path does not exist: "${inspection.absolutePath}".`);
+    }
+
+    if (inspection.isDirectory) {
+      const glob = new Glob("**/*");
+      let dirCount = 0;
+      for await (const relFile of glob.scan({
+        cwd: inspection.absolutePath,
+        onlyFiles: true,
+        dot: includeHidden,
+      })) {
+        const absFile = resolve(inspection.absolutePath, relFile);
+        if (seenPaths.has(absFile)) continue;
+        seenPaths.add(absFile);
+        dirCount++;
+
+        const normalizedRel = normalizeSlashes(relFile);
+        targets.push({
+          localPath: absFile,
+          relativePath: normalizedRel,
+          objectKey: joinObjectKey(keyOrPrefix, normalizedRel),
+          sizeBytes: Bun.file(absFile).size,
+        });
+      }
+
+      if (dirCount === 0) {
+        throw new Error(`Directory "${inspection.absolutePath}" contains no uploadable files.`);
+      }
+      continue;
+    }
+
+    if (!inspection.isFile) {
+      throw new Error(`Input path "${inspection.absolutePath}" is not a regular file or directory.`);
+    }
+
+    if (seenPaths.has(inspection.absolutePath)) continue;
+    seenPaths.add(inspection.absolutePath);
+
+    // If a single file was passed with explicit `--key`, treat `--key` as the full object key.
+    // If multiple files were passed with `--key`/`--prefix`, treat it as a key prefix.
+    const objectKey = isSingleLiteralInput
+      ? (keyOrPrefix?.trim() ? normalizeSlashes(keyOrPrefix.trim()).replace(/^\/+/, "") : inspection.fileName)
+      : joinObjectKey(keyOrPrefix, inspection.fileName);
+
+    targets.push({
+      localPath: inspection.absolutePath,
+      relativePath: inspection.fileName,
+      objectKey,
+      sizeBytes: inspection.sizeBytes,
+    });
+  }
+
+  targets.sort((a, b) => a.objectKey.localeCompare(b.objectKey));
+  return targets;
 }

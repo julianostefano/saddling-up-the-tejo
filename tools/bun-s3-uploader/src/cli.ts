@@ -21,13 +21,22 @@ import {
   resolveTargetEndpointOrigin,
   validateAndResolveAuth,
 } from "./env.ts";
-import { startIsolatedUploadSession } from "./session-runner.ts";
-import { executeS3Upload } from "./uploader.ts";
+import {
+  startIsolatedBatchUploadSession,
+  startIsolatedUploadSession,
+} from "./session-runner.ts";
+import { resolveUploadTargets } from "./shell.ts";
+import { executeBatchUpload, executeS3Upload } from "./uploader.ts";
 import type {
+  BatchUploadReport,
   CliOptions,
+  OverwriteDecision,
+  OverwritePromptInfo,
   ProgressSnapshot,
+  ResolvedUploadTarget,
   S3Acl,
   S3StorageClass,
+  UploadCallbacks,
   UploadReport,
   VerifyMode,
 } from "./types.ts";
@@ -64,21 +73,27 @@ export function getHelpText(): string {
 Bun Native S3 Uploader v${APP_VERSION}
 
 Usage:
-  bun run src/index.ts <file-path> <bucket> [key] [options]
-  bun run src/index.ts <file-path> s3://<bucket>/<key> [options]
-  bun run src/index.ts --file <path> --bucket <name> [options]
+  bun run src/index.ts <file-dir-or-glob> <bucket> [key-or-prefix] [options]
+  bun run src/index.ts <file-dir-or-glob> s3://<bucket>/<prefix> [options]
+  bun run src/index.ts --file <path|dir|glob> --bucket <name> [options]
   bun run src/index.ts --tui
 
 Target & File Options:
-  -f, --file <path>              Local file path to upload
+  -f, --file <path|dir|glob>     Local file, directory (recursive), or wildcard pattern (repeatable)
   -b, --bucket <name>            Destination S3 bucket (fallback: S3_BUCKET / AWS_BUCKET)
-  -k, --key <object-key>         Destination object key (default: file basename)
+      --key, --prefix <key>      Object key (single file) or key prefix (directory/wildcard/multi-file)
+      --dot, --include-hidden    Include hidden dotfiles when scanning directories or wildcards
   -e, --endpoint <url>           S3-compatible endpoint URL (fallback: S3_ENDPOINT / AWS_ENDPOINT)
   -r, --region <region>          AWS region (fallback: S3_REGION / AWS_REGION, default: us-east-1)
       --virtual-hosted-style     Use virtual hosted-style S3 URLs
       --acl <acl>                Object ACL (private, public-read, bucket-owner-full-control, ...)
       --storage-class <class>    S3 storage class (STANDARD, STANDARD_IA, GLACIER, ...)
       --request-payer            Set x-amz-request-payer for requester-pays buckets
+
+Overwrite Protection Options:
+  -y, --yes, --overwrite         Overwrite existing S3 objects without prompting
+      --skip-existing, --no-overwrite
+                                 Skip existing S3 objects without overwriting
 
 Multipart & Transfer Options:
       --part-size <size>         Multipart chunk size, 5MiB..5GiB (default: 5MiB)
@@ -90,14 +105,14 @@ Multipart & Transfer Options:
 Integrity, Proxy & TLS Options:
       --verify <mode>            Verification mode: full | stat | none (default: full)
       --proxy <url>              HTTP/HTTPS proxy URL (overrides HTTP_PROXY / HTTPS_PROXY)
-      --insecure, --allow-invalid-certs
+  -k, --insecure, --allow-invalid-certs
                                  Allow invalid/self-signed TLS certificates (NODE_TLS_REJECT_UNAUTHORIZED=0)
       --strict-tls               Enforce strict TLS certificate verification
 
 Execution & Output Options:
       --isolated                 Run upload inside an isolated Bun.ModuleGraph session
       --tui                      Launch interactive Terminal UI
-      --dry-run                  Analyze file, validate env/proxy/TLS, and compute SHA-256 without uploading
+      --dry-run                  Analyze files, validate env/proxy/TLS, and compute SHA-256 without uploading
       --json                     Print final structured JSON report
   -h, --help                     Show this help message
   -v, --version                  Show version
@@ -116,12 +131,15 @@ Environment Variables:
  */
 export function parseCliArgs(argv: string[]): CliOptions {
   const options: CliOptions = {
+    filePaths: [],
     partSize: DEFAULT_PART_SIZE,
     multipartThreshold: DEFAULT_MULTIPART_THRESHOLD,
     queueSize: DEFAULT_QUEUE_SIZE,
     retry: DEFAULT_RETRY,
     verifyMode: "full",
     linkSpeedMbps: DEFAULT_LINK_SPEED_MBPS,
+    overwritePolicy: "ask",
+    includeHidden: false,
     isolated: false,
     tui: false,
     json: false,
@@ -130,6 +148,8 @@ export function parseCliArgs(argv: string[]): CliOptions {
     version: false,
   };
 
+  let explicitOverwrite = false;
+  let explicitSkip = false;
   const positionals: string[] = [];
 
   const readValue = (idx: number, flag: string, inlineVal?: string): { value: string; nextIdx: number } => {
@@ -179,6 +199,22 @@ export function parseCliArgs(argv: string[]): CliOptions {
       case "--request-payer":
         options.requestPayer = true;
         break;
+      case "--dot":
+      case "--include-hidden":
+        options.includeHidden = true;
+        break;
+      case "-y":
+      case "--yes":
+      case "--overwrite":
+        explicitOverwrite = true;
+        options.overwritePolicy = "overwrite";
+        break;
+      case "--skip-existing":
+      case "--no-overwrite":
+        explicitSkip = true;
+        options.overwritePolicy = "skip";
+        break;
+      case "-k":
       case "--insecure":
       case "--allow-invalid-certs":
         options.insecure = true;
@@ -189,7 +225,8 @@ export function parseCliArgs(argv: string[]): CliOptions {
       case "-f":
       case "--file": {
         const res = readValue(i, flag, inlineVal);
-        options.filePath = res.value;
+        options.filePaths!.push(res.value);
+        if (!options.filePath) options.filePath = res.value;
         i = res.nextIdx;
         break;
       }
@@ -200,12 +237,8 @@ export function parseCliArgs(argv: string[]): CliOptions {
         i = res.nextIdx;
         break;
       }
-      case "-k":
-        // Support `-k` both as curl-style `--insecure` when no value follows or `--key` if not ambiguous?
-        // To stay unambiguous, `-k` is `--insecure` (like curl) and `--key` is object key; if user wants short flag for key, use `--key`.
-        options.insecure = true;
-        break;
-      case "--key": {
+      case "--key":
+      case "--prefix": {
         const res = readValue(i, flag, inlineVal);
         options.key = res.value;
         i = res.nextIdx;
@@ -308,20 +341,28 @@ export function parseCliArgs(argv: string[]): CliOptions {
     }
   }
 
-  // Assign positional arguments: <filePath> <bucket-or-s3-uri> [key]
-  if (positionals.length > 0 && !options.filePath) {
-    options.filePath = positionals.shift();
+  if (explicitOverwrite && explicitSkip) {
+    throw new Error("Cannot combine --yes/--overwrite with --skip-existing/--no-overwrite.");
+  }
+
+  // Assign positional arguments:
+  // If --file was NOT given: <file-dir-or-glob> <bucket-or-s3-uri> [key-or-prefix]
+  // If --file WAS given and --bucket was NOT given: first positional can be bucket/s3-uri.
+  if (positionals.length > 0 && options.filePaths!.length === 0) {
+    const first = positionals.shift()!;
+    options.filePaths!.push(first);
+    options.filePath = first;
   }
   if (positionals.length > 0 && !options.bucket) {
-    const second = positionals.shift()!;
-    const s3Uri = parseS3Uri(second);
+    const next = positionals.shift()!;
+    const s3Uri = parseS3Uri(next);
     if (s3Uri) {
       options.bucket = s3Uri.bucket;
       if (s3Uri.key && !options.key) {
         options.key = s3Uri.key;
       }
     } else {
-      options.bucket = second;
+      options.bucket = next;
     }
   }
   if (positionals.length > 0 && !options.key) {
@@ -357,188 +398,53 @@ function formatProgressLine(snap: ProgressSnapshot): string {
   return `${phaseLabel} ${bar} ${transferred}${parts} | ${speed} | BW ${bw} | ${eta}`;
 }
 
-/**
- * Runs the CLI upload workflow and returns an exit code (0 on success, 1 on failure).
- */
-export async function runCli(argv: string[]): Promise<number> {
-  let options: CliOptions;
-  try {
-    options = parseCliArgs(argv);
-  } catch (err) {
-    console.error(`Argument Error: ${err instanceof Error ? err.message : String(err)}`);
-    console.error("Run with --help for usage details.");
-    return 1;
+async function promptCliOverwrite(info: OverwritePromptInfo): Promise<OverwriteDecision> {
+  const remoteMetaParts: string[] = [];
+  if (info.remoteSizeBytes !== undefined) {
+    remoteMetaParts.push(`remote size: ${formatBytes(info.remoteSizeBytes)}`);
   }
-
-  if (options.help) {
-    console.log(getHelpText());
-    return 0;
+  if (info.remoteEtag) {
+    remoteMetaParts.push(`ETag: ${info.remoteEtag}`);
   }
+  remoteMetaParts.push(`local size: ${formatBytes(info.localSizeBytes)}`);
 
-  if (options.version) {
-    console.log(`bun-s3-uploader v${APP_VERSION} (Bun ${Bun.version})`);
-    return 0;
-  }
+  process.stdout.write(
+    `\nObject "s3://${info.bucket}/${info.key}" already exists (${remoteMetaParts.join(", ")}).\n` +
+      `Overwrite? [y]es / [N]o (skip) / [a]ll / [s]kip all / [q]uit: `,
+  );
 
-  const missingInputs: string[] = [];
-  if (!options.filePath) {
-    missingInputs.push("Missing input file path (<file-path> or --file <path>).");
-  }
-
-  const validation = validateAndResolveAuth(options);
-  if (!validation.valid || !validation.auth || missingInputs.length > 0) {
-    if (options.json) {
-      console.error(
-        JSON.stringify(
-          {
-            success: false,
-            error: "Missing required arguments or environment variables",
-            missingInputs,
-            missingEnv: validation.missing,
-          },
-          null,
-          2,
-        ),
-      );
-    } else {
-      for (const msg of missingInputs) {
-        console.error(`Error: ${msg}`);
+  const answer = await new Promise<string>((resolveAnswer) => {
+    let buf = "";
+    const onData = (chunk: Buffer) => {
+      buf += chunk.toString("utf8");
+      const nlIdx = buf.search(/\r?\n/);
+      if (nlIdx !== -1) {
+        process.stdin.off("data", onData);
+        process.stdin.pause();
+        resolveAnswer(buf.slice(0, nlIdx).trim().toLowerCase());
       }
-      if (!validation.valid) {
-        console.error(formatMissingConfigError(validation.missing));
-      }
-      console.error("\nRun with --help for usage information or --tui for interactive mode.");
-    }
-    return 1;
-  }
+    };
+    process.stdin.resume();
+    process.stdin.on("data", onData);
+  });
 
-  const auth = validation.auth;
-  const targetOrigin = resolveTargetEndpointOrigin(auth);
-  const proxy = resolveAndApplyProxy(targetOrigin, options.proxy);
-  const tls = resolveAndApplyTls(options);
+  if (answer === "y" || answer === "yes") return "overwrite";
+  if (answer === "a" || answer === "all") return "overwrite-all";
+  if (answer === "s" || answer === "skip" || answer === "skip-all") return "skip-all";
+  if (answer === "q" || answer === "quit" || answer === "abort") return "abort";
+  return "skip";
+}
 
-  const isTty = Boolean(process.stdout.isTTY) && !options.json;
-
-  if (!options.json) {
-    console.log("=== Bun Native S3 Uploader ===");
-    for (const warning of validation.warnings) {
-      console.log(`Warning: ${warning}`);
-    }
-    console.log(`File:      ${options.filePath}`);
-    const displayKey = options.key
-      ? options.key.replace(/^\/+/, "")
-      : options.filePath!.split(/[\\/]/).pop();
-    console.log(`Target:    s3://${auth.bucket}/${displayKey}`);
-    console.log(`Endpoint:  ${targetOrigin} (region: ${auth.region})`);
-    console.log(
-      `Auth:      key=${auth.sources.accessKeyId}, secret=${auth.sources.secretAccessKey}${auth.sources.sessionToken ? `, token=${auth.sources.sessionToken}` : ""}`,
-    );
-    if (proxy.activeProxyUrl) {
-      console.log(`Proxy:     ${maskProxyUrl(proxy.activeProxyUrl)} (via ${proxy.sourceEnvVar})`);
-    } else if (proxy.bypassedByNoProxy) {
-      console.log(`Proxy:     direct (bypassed by NO_PROXY="${proxy.noProxy}")`);
-    } else {
-      console.log("Proxy:     direct (no proxy configured)");
-    }
-    console.log(
-      `TLS:       ${tls.allowInvalidCerts ? `allow invalid certificates (${tls.source})` : "strict certificate verification"}`,
-    );
-    console.log(`Verify:    ${options.verifyMode}${options.isolated ? " | Execution: isolated Bun.ModuleGraph" : ""}`);
-    console.log("");
-  }
-
-  let lastRenderedPhase = "";
-  let lastNonTtyPct = -1;
-
-  const renderProgress = (snap: ProgressSnapshot) => {
-    if (options.json) return;
-    const line = formatProgressLine(snap);
-    if (isTty) {
-      if (lastRenderedPhase && lastRenderedPhase !== snap.phase) {
-        process.stdout.write("\n");
-      }
-      lastRenderedPhase = snap.phase;
-      process.stdout.write(`\r\x1b[K${line}`);
-      if (snap.percent >= 100) {
-        process.stdout.write("\n");
-        lastRenderedPhase = "";
-      }
-    } else {
-      const bucketPct = snap.percent >= 100 ? 100 : Math.floor(snap.percent / 25) * 25;
-      if (lastRenderedPhase !== snap.phase || bucketPct > lastNonTtyPct) {
-        if (lastRenderedPhase !== snap.phase) {
-          lastNonTtyPct = -1;
-        }
-        lastRenderedPhase = snap.phase;
-        lastNonTtyPct = bucketPct;
-        console.log(line);
-      }
-    }
-  };
-
-  const callbacks = {
-    onAnalysis: (analysis: UploadReport["fileAnalysis"]) => {
-      if (!options.json) {
-        console.log(
-          `Analysis:  ${analysis.fileName} (${formatBytes(analysis.sizeBytes)}, ${analysis.mimeType})`,
-        );
-        console.log(`Strategy:  ${analysis.reason}`);
-      }
-    },
-    onLog: (level: "info" | "warn" | "error" | "success", message: string) => {
-      if (options.json) return;
-      if (level === "warn") console.warn(`Warning: ${message}`);
-      else if (level === "error") console.error(`Error: ${message}`);
-    },
-    onProgress: renderProgress,
-  };
-
-  let report: UploadReport;
-  try {
-    if (options.isolated) {
-      const controller = startIsolatedUploadSession(
-        options,
-        auth,
-        proxy,
-        tls,
-        {
-          HTTP_PROXY: process.env.HTTP_PROXY,
-          HTTPS_PROXY: process.env.HTTPS_PROXY,
-          ALL_PROXY: process.env.ALL_PROXY,
-          NO_PROXY: process.env.NO_PROXY,
-        },
-        callbacks,
-      );
-      const onSigInt = () => controller.cancel("Interrupted by SIGINT");
-      process.once("SIGINT", onSigInt);
-      try {
-        report = await controller.promise;
-      } finally {
-        process.removeListener("SIGINT", onSigInt);
-      }
-    } else {
-      report = await executeS3Upload(options, auth, proxy, tls, callbacks);
-    }
-  } catch (err) {
-    if (isTty && lastRenderedPhase) {
-      process.stdout.write("\n");
-    }
-    const msg = err instanceof Error ? err.message : String(err);
-    if (options.json) {
-      console.error(JSON.stringify({ success: false, error: msg }, null, 2));
-    } else {
-      console.error(`\nUpload Failed: ${msg}`);
-    }
-    return 1;
-  }
-
-  if (options.json) {
-    console.log(JSON.stringify(report, null, 2));
-    return report.success ? 0 : 1;
-  }
-
+function printSingleReportSummary(report: UploadReport, options: CliOptions): void {
   console.log("");
   console.log("=== Transfer & Integrity Summary ===");
+  if (report.skipped) {
+    console.log("Status:           SKIPPED");
+    console.log(`Object:           s3://${report.bucket}/${report.key}`);
+    console.log(`Reason:           ${report.skipReason ?? "Object already exists"}`);
+    return;
+  }
+
   console.log(`Status:           ${report.success ? "SUCCESS" : "FAILED"}`);
   console.log(`Object:           s3://${report.bucket}/${report.key}`);
   console.log(
@@ -584,6 +490,305 @@ export async function runCli(argv: string[]): Promise<number> {
   } else {
     console.log(`Verification:     skipped (mode=${report.verification.mode})`);
   }
+}
 
-  return report.success ? 0 : 1;
+function printBatchReportSummary(batch: BatchUploadReport): void {
+  console.log("");
+  console.log("=== Batch Transfer Summary ===");
+  console.log(`Status:           ${batch.success ? "SUCCESS" : "FAILED"}`);
+  console.log(`Bucket:           s3://${batch.bucket}`);
+  console.log(
+    `Files:            ${batch.totalFiles} total | ${batch.uploadedCount} uploaded | ${batch.skippedCount} skipped | ${batch.failedCount} failed`,
+  );
+  console.log(`Uploaded Volume:  ${formatBytes(batch.uploadedBytes)} / ${formatBytes(batch.totalBytes)}`);
+  console.log(`Total Duration:   ${formatDurationMs(batch.durationMs)}`);
+  console.log(`Average Speed:    ${formatSpeed(batch.avgSpeedBytesPerSec)}`);
+  console.log(`Average BW Used:  ${formatBandwidth(batch.avgBandwidthMbps)}`);
+  console.log("");
+  for (const r of batch.results) {
+    const tag = r.skipped ? "[SKIP]" : r.success ? "[OK]  " : "[FAIL]";
+    const detail = r.skipped
+      ? r.skipReason ?? "skipped"
+      : `${formatBytes(r.fileAnalysis.sizeBytes)} | ${r.upload.strategy} | SHA-256 ${r.checksum.sha256Hex.slice(0, 12)}...`;
+    console.log(`  ${tag} s3://${r.bucket}/${r.key} (${detail})`);
+  }
+}
+
+/**
+ * Runs the CLI upload workflow and returns an exit code (0 on success, 1 on failure).
+ */
+export async function runCli(
+  argv: string[],
+  hooks: { confirmOverwrite?: UploadCallbacks["confirmOverwrite"] } = {},
+): Promise<number> {
+  let options: CliOptions;
+  try {
+    options = parseCliArgs(argv);
+  } catch (err) {
+    console.error(`Argument Error: ${err instanceof Error ? err.message : String(err)}`);
+    console.error("Run with --help for usage details.");
+    return 1;
+  }
+
+  if (options.help) {
+    console.log(getHelpText());
+    return 0;
+  }
+
+  if (options.version) {
+    console.log(`bun-s3-uploader v${APP_VERSION} (Bun ${Bun.version})`);
+    return 0;
+  }
+
+  const inputPatterns = options.filePaths?.length
+    ? options.filePaths
+    : options.filePath
+      ? [options.filePath]
+      : [];
+
+  const missingInputs: string[] = [];
+  if (inputPatterns.length === 0) {
+    missingInputs.push("Missing input path (<file-dir-or-glob> or --file <path>).");
+  }
+
+  const validation = validateAndResolveAuth(options);
+  if (!validation.valid || !validation.auth || missingInputs.length > 0) {
+    if (options.json) {
+      console.error(
+        JSON.stringify(
+          {
+            success: false,
+            error: "Missing required arguments or environment variables",
+            missingInputs,
+            missingEnv: validation.missing,
+          },
+          null,
+          2,
+        ),
+      );
+    } else {
+      for (const msg of missingInputs) {
+        console.error(`Error: ${msg}`);
+      }
+      if (!validation.valid) {
+        console.error(formatMissingConfigError(validation.missing));
+      }
+      console.error("\nRun with --help for usage information or --tui for interactive mode.");
+    }
+    return 1;
+  }
+
+  const auth = validation.auth;
+  const targetOrigin = resolveTargetEndpointOrigin(auth);
+  const proxy = resolveAndApplyProxy(targetOrigin, options.proxy);
+  const tls = resolveAndApplyTls(options);
+
+  let targets: ResolvedUploadTarget[];
+  try {
+    targets = await resolveUploadTargets(inputPatterns, options.key, {
+      includeHidden: options.includeHidden,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (options.json) {
+      console.error(JSON.stringify({ success: false, error: msg }, null, 2));
+    } else {
+      console.error(`Input Error: ${msg}`);
+    }
+    return 1;
+  }
+
+  const isTty = Boolean(process.stdout.isTTY) && !options.json;
+  const isInteractiveStdin = Boolean(process.stdin.isTTY) && isTty;
+  const totalBatchBytes = targets.reduce((acc, t) => acc + t.sizeBytes, 0);
+
+  if (!options.json) {
+    console.log("=== Bun Native S3 Uploader ===");
+    for (const warning of validation.warnings) {
+      console.log(`Warning: ${warning}`);
+    }
+    if (targets.length === 1) {
+      console.log(`File:      ${targets[0]!.localPath}`);
+      console.log(`Target:    s3://${auth.bucket}/${targets[0]!.objectKey}`);
+    } else {
+      console.log(`Inputs:    ${inputPatterns.join(", ")}`);
+      console.log(`Matched:   ${targets.length} file(s) (${formatBytes(totalBatchBytes)})`);
+      console.log(`Target:    s3://${auth.bucket}/${options.key ? `${options.key.replace(/^\/+|\/+$/g, "")}/` : ""}`);
+    }
+    console.log(`Endpoint:  ${targetOrigin} (region: ${auth.region})`);
+    console.log(
+      `Auth:      key=${auth.sources.accessKeyId}, secret=${auth.sources.secretAccessKey}${auth.sources.sessionToken ? `, token=${auth.sources.sessionToken}` : ""}`,
+    );
+    if (proxy.activeProxyUrl) {
+      console.log(`Proxy:     ${maskProxyUrl(proxy.activeProxyUrl)} (via ${proxy.sourceEnvVar})`);
+    } else if (proxy.bypassedByNoProxy) {
+      console.log(`Proxy:     direct (bypassed by NO_PROXY="${proxy.noProxy}")`);
+    } else {
+      console.log("Proxy:     direct (no proxy configured)");
+    }
+    console.log(
+      `TLS:       ${tls.allowInvalidCerts ? `allow invalid certificates (${tls.source})` : "strict certificate verification"}`,
+    );
+    console.log(
+      `Overwrite: ${options.overwritePolicy} | Verify: ${options.verifyMode}${options.isolated ? " | Execution: isolated Bun.ModuleGraph" : ""}`,
+    );
+    console.log("");
+  }
+
+  let lastRenderedPhase = "";
+  let lastNonTtyPct = -1;
+
+  const resetProgressState = () => {
+    if (isTty && lastRenderedPhase) {
+      process.stdout.write("\n");
+    }
+    lastRenderedPhase = "";
+    lastNonTtyPct = -1;
+  };
+
+  const renderProgress = (snap: ProgressSnapshot) => {
+    if (options.json) return;
+    const line = formatProgressLine(snap);
+    if (isTty) {
+      if (lastRenderedPhase && lastRenderedPhase !== snap.phase) {
+        process.stdout.write("\n");
+      }
+      lastRenderedPhase = snap.phase;
+      process.stdout.write(`\r\x1b[K${line}`);
+      if (snap.percent >= 100) {
+        process.stdout.write("\n");
+        lastRenderedPhase = "";
+      }
+    } else {
+      const bucketPct = snap.percent >= 100 ? 100 : Math.floor(snap.percent / 25) * 25;
+      if (lastRenderedPhase !== snap.phase || bucketPct > lastNonTtyPct) {
+        if (lastRenderedPhase !== snap.phase) {
+          lastNonTtyPct = -1;
+        }
+        lastRenderedPhase = snap.phase;
+        lastNonTtyPct = bucketPct;
+        console.log(line);
+      }
+    }
+  };
+
+  const confirmOverwriteHandler: UploadCallbacks["confirmOverwrite"] =
+    hooks.confirmOverwrite ??
+    (isInteractiveStdin
+      ? async (info) => {
+          resetProgressState();
+          return await promptCliOverwrite(info);
+        }
+      : undefined);
+
+  const callbacks: UploadCallbacks = {
+    onTargetStart: (idx, total, target) => {
+      resetProgressState();
+      if (!options.json && total > 1) {
+        console.log(
+          `\n[${idx}/${total}] ${target.relativePath} -> s3://${auth.bucket}/${target.objectKey}`,
+        );
+      }
+    },
+    onAnalysis: (analysis) => {
+      if (!options.json) {
+        console.log(
+          `Analysis:  ${analysis.fileName} (${formatBytes(analysis.sizeBytes)}, ${analysis.mimeType})`,
+        );
+        console.log(`Strategy:  ${analysis.reason}`);
+      }
+    },
+    onLog: (level, message) => {
+      if (options.json) return;
+      if (level === "warn") console.warn(`Warning: ${message}`);
+      else if (level === "error") console.error(`Error: ${message}`);
+    },
+    onProgress: renderProgress,
+    confirmOverwrite: confirmOverwriteHandler,
+  };
+
+  const envProxyOverrides = {
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    HTTPS_PROXY: process.env.HTTPS_PROXY,
+    ALL_PROXY: process.env.ALL_PROXY,
+    NO_PROXY: process.env.NO_PROXY,
+  };
+
+  try {
+    if (targets.length === 1) {
+      const singleTarget = targets[0]!;
+      const singleOpts: CliOptions = {
+        ...options,
+        filePath: singleTarget.localPath,
+        key: singleTarget.objectKey,
+      };
+
+      let report: UploadReport;
+      if (options.isolated) {
+        const controller = startIsolatedUploadSession(
+          singleOpts,
+          auth,
+          proxy,
+          tls,
+          envProxyOverrides,
+          callbacks,
+        );
+        const onSigInt = () => controller.cancel("Interrupted by SIGINT");
+        process.once("SIGINT", onSigInt);
+        try {
+          report = await controller.promise;
+        } finally {
+          process.removeListener("SIGINT", onSigInt);
+        }
+      } else {
+        report = await executeS3Upload(singleOpts, auth, proxy, tls, callbacks);
+      }
+
+      if (options.json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        printSingleReportSummary(report, options);
+      }
+      return report.success ? 0 : 1;
+    }
+
+    // Batch upload (wildcards or directory)
+    let batchReport: BatchUploadReport;
+    if (options.isolated) {
+      const controller = startIsolatedBatchUploadSession(
+        targets,
+        options,
+        auth,
+        proxy,
+        tls,
+        envProxyOverrides,
+        callbacks,
+      );
+      const onSigInt = () => controller.cancel("Interrupted by SIGINT");
+      process.once("SIGINT", onSigInt);
+      try {
+        batchReport = await controller.promise;
+      } finally {
+        process.removeListener("SIGINT", onSigInt);
+      }
+    } else {
+      batchReport = await executeBatchUpload(targets, options, auth, proxy, tls, callbacks);
+    }
+
+    if (options.json) {
+      console.log(JSON.stringify(batchReport, null, 2));
+    } else {
+      printBatchReportSummary(batchReport);
+    }
+    return batchReport.success ? 0 : 1;
+  } catch (err) {
+    resetProgressState();
+    const msg = err instanceof Error ? err.message : String(err);
+    if (options.json) {
+      console.error(JSON.stringify({ success: false, error: msg }, null, 2));
+    } else {
+      console.error(`\nUpload Failed: ${msg}`);
+    }
+    return 1;
+  }
 }

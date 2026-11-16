@@ -6,6 +6,7 @@ import {
   DEFAULT_RETRY,
   MAX_S3_PART_SIZE,
   MIN_S3_PART_SIZE,
+  bytesPerSecToMbps,
   formatBytes,
   normalizeEtag,
 } from "./format.ts";
@@ -13,9 +14,12 @@ import { computeFileChecksumsInWorker } from "./hasher.ts";
 import { TransferMeter } from "./metrics.ts";
 import { inspectLocalPathWithShell } from "./shell.ts";
 import type {
+  BatchUploadReport,
   CliOptions,
   FileAnalysis,
+  OverwritePolicy,
   ProxyConfig,
+  ResolvedUploadTarget,
   S3AuthConfig,
   TlsConfig,
   UploadCallbacks,
@@ -142,6 +146,125 @@ export async function executeS3Upload(
   callbacks.onAnalysis?.(analysis);
   callbacks.onLog?.("info", analysis.reason);
 
+  const client = new S3Client({
+    accessKeyId: auth.accessKeyId,
+    secretAccessKey: auth.secretAccessKey,
+    region: auth.region,
+    endpoint: auth.endpoint,
+    bucket: auth.bucket,
+    sessionToken: auth.sessionToken,
+    virtualHostedStyle: auth.virtualHostedStyle,
+    acl: auth.acl,
+    storageClass: auth.storageClass,
+    requestPayer: auth.requestPayer,
+    partSize: analysis.partSize,
+    queueSize: analysis.queueSize,
+    retry: options.retry,
+  });
+
+  const s3File = client.file(objectKey, {
+    type: analysis.mimeType,
+    acl: auth.acl,
+    storageClass: auth.storageClass,
+    requestPayer: auth.requestPayer,
+  });
+
+  const overwritePolicy: OverwritePolicy = options.overwritePolicy ?? "ask";
+  let nextBatchPolicy: OverwritePolicy | undefined;
+
+  if (!options.dryRun && overwritePolicy !== "overwrite") {
+    let exists = false;
+    try {
+      exists = await s3File.exists();
+    } catch (err) {
+      throw new Error(formatUploadError(err, tls, proxy), { cause: err });
+    }
+
+    if (exists) {
+      let remoteSizeBytes: number | undefined;
+      let remoteEtag: string | undefined;
+      let remoteLastModified: Date | undefined;
+      try {
+        const remoteStat = await s3File.stat();
+        remoteSizeBytes = remoteStat.size;
+        remoteEtag = normalizeEtag(remoteStat.etag);
+        remoteLastModified = remoteStat.lastModified;
+      } catch {
+        // Proceed even if HEAD stat metadata is unavailable
+      }
+
+      const makeSkippedReport = (reason: string): UploadReport => ({
+        success: true,
+        skipped: true,
+        skipReason: reason,
+        bucket: auth.bucket,
+        key: objectKey,
+        endpoint: proxy.targetOrigin,
+        region: auth.region,
+        fileAnalysis: analysis,
+        checksum: { sha256Hex: "", md5Hex: "", partCount: 0, elapsedMs: 0 },
+        proxy,
+        tls,
+        upload: {
+          strategy: analysis.useMultipart ? "multipart" : "single-part",
+          partsUploaded: 0,
+          bytesUploaded: 0,
+          durationMs: 0,
+          avgSpeedBytesPerSec: 0,
+          peakSpeedBytesPerSec: 0,
+          avgBandwidthMbps: 0,
+          bandwidthUtilizationPct: 0,
+        },
+        verification: {
+          mode: options.verifyMode,
+          performed: false,
+          remoteExists: true,
+          remoteSizeBytes,
+          remoteEtag,
+          sizeMatch: null,
+          etagMatch: null,
+          sha256Match: null,
+          elapsedMs: 0,
+        },
+      });
+
+      if (overwritePolicy === "skip") {
+        callbacks.onLog?.("warn", `Skipped existing object "s3://${auth.bucket}/${objectKey}".`);
+        return makeSkippedReport("Object already exists (--skip-existing).");
+      }
+
+      if (!callbacks.confirmOverwrite) {
+        throw new Error(
+          `Object "s3://${auth.bucket}/${objectKey}" already exists` +
+            `${remoteSizeBytes !== undefined ? ` (${formatBytes(remoteSizeBytes)})` : ""} ` +
+            `and overwrite confirmation is required. Pass --yes (--overwrite) to overwrite or --skip-existing to skip.`,
+        );
+      }
+
+      const decision = await callbacks.confirmOverwrite({
+        bucket: auth.bucket,
+        key: objectKey,
+        localPath: analysis.absolutePath,
+        localSizeBytes: analysis.sizeBytes,
+        remoteSizeBytes,
+        remoteEtag,
+        remoteLastModified,
+      });
+
+      if (decision === "abort") {
+        throw new Error(`Upload aborted by user to avoid overwriting "s3://${auth.bucket}/${objectKey}".`);
+      }
+      if (decision === "skip" || decision === "skip-all") {
+        if (decision === "skip-all") nextBatchPolicy = "skip";
+        callbacks.onLog?.("warn", `Skipped existing object "s3://${auth.bucket}/${objectKey}".`);
+        return makeSkippedReport("Skipped by user confirmation.");
+      }
+      if (decision === "overwrite-all") {
+        nextBatchPolicy = "overwrite";
+      }
+    }
+  }
+
   // Phase 1: Compute SHA-256, MD5, and S3 multipart ETag in a background Worker thread.
   const checksum = await computeFileChecksumsInWorker(analysis.absolutePath, analysis.sizeBytes, {
     partSize: analysis.partSize,
@@ -184,28 +307,8 @@ export async function executeS3Upload(
     };
   }
 
-  const client = new S3Client({
-    accessKeyId: auth.accessKeyId,
-    secretAccessKey: auth.secretAccessKey,
-    region: auth.region,
-    endpoint: auth.endpoint,
-    bucket: auth.bucket,
-    sessionToken: auth.sessionToken,
-    virtualHostedStyle: auth.virtualHostedStyle,
-    acl: auth.acl,
-    storageClass: auth.storageClass,
-    requestPayer: auth.requestPayer,
-    partSize: analysis.partSize,
-    queueSize: analysis.queueSize,
-    retry: options.retry,
-  });
-
-  const s3File = client.file(objectKey, {
-    type: analysis.mimeType,
-    acl: auth.acl,
-    storageClass: auth.storageClass,
-    requestPayer: auth.requestPayer,
-  });
+  // Propagate batch policy choice if caller tracks it (used internally by executeBatchUpload)
+  void nextBatchPolicy;
 
   const uploadMeter = new TransferMeter("uploading", analysis.sizeBytes, options.linkSpeedMbps);
   const uploadStartMs = performance.now();
@@ -442,5 +545,83 @@ async function verifyUploadedObject(
     downloadSpeedBytesPerSec: verifySnap.avgSpeedBytesPerSec,
     downloadBandwidthMbps: (verifySnap.avgSpeedBytesPerSec * 8) / 1_000_000,
     elapsedMs: Math.max(1, performance.now() - verifyStartMs),
+  };
+}
+
+/**
+ * Executes a multi-file upload batch (wildcards / directories) with shared overwrite policy state
+ * ("overwrite-all" / "skip-all") and aggregate speed/bandwidth reporting.
+ */
+export async function executeBatchUpload(
+  targets: ResolvedUploadTarget[],
+  options: CliOptions,
+  auth: S3AuthConfig,
+  proxy: ProxyConfig,
+  tls: TlsConfig,
+  callbacks: UploadCallbacks = {},
+): Promise<BatchUploadReport> {
+  const startMs = performance.now();
+  const results: UploadReport[] = [];
+  let effectivePolicy: OverwritePolicy = options.overwritePolicy ?? "ask";
+  let uploadedCount = 0;
+  let skippedCount = 0;
+  let failedCount = 0;
+  let uploadedBytes = 0;
+  const totalBytes = targets.reduce((acc, t) => acc + t.sizeBytes, 0);
+
+  for (let i = 0; i < targets.length; i++) {
+    const target = targets[i]!;
+    callbacks.onTargetStart?.(i + 1, targets.length, target);
+
+    const itemOptions: CliOptions = {
+      ...options,
+      filePath: target.localPath,
+      key: target.objectKey,
+      overwritePolicy: effectivePolicy,
+    };
+
+    const itemCallbacks: UploadCallbacks = {
+      ...callbacks,
+      confirmOverwrite: callbacks.confirmOverwrite
+        ? async (info) => {
+            const decision = await callbacks.confirmOverwrite!(info);
+            if (decision === "overwrite-all") effectivePolicy = "overwrite";
+            if (decision === "skip-all") effectivePolicy = "skip";
+            return decision;
+          }
+        : undefined,
+    };
+
+    const report = await executeS3Upload(itemOptions, auth, proxy, tls, itemCallbacks);
+    results.push(report);
+
+    if (report.skipped) {
+      skippedCount++;
+    } else if (report.success) {
+      uploadedCount++;
+      uploadedBytes += report.upload.bytesUploaded;
+    } else {
+      failedCount++;
+    }
+  }
+
+  const durationMs = Math.max(1, performance.now() - startMs);
+  const avgSpeedBytesPerSec = (uploadedBytes / durationMs) * 1000;
+
+  return {
+    success: failedCount === 0,
+    bucket: auth.bucket,
+    endpoint: proxy.targetOrigin,
+    region: auth.region,
+    totalFiles: targets.length,
+    uploadedCount,
+    skippedCount,
+    failedCount,
+    totalBytes,
+    uploadedBytes,
+    durationMs,
+    avgSpeedBytesPerSec,
+    avgBandwidthMbps: bytesPerSecToMbps(avgSpeedBytesPerSec),
+    results,
   };
 }

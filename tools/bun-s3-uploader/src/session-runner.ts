@@ -1,30 +1,42 @@
 import { fileURLToPath } from "node:url";
 import type {
+  BatchUploadReport,
   CliOptions,
   ProxyConfig,
+  ResolvedUploadTarget,
   S3AuthConfig,
   TlsConfig,
   UploadCallbacks,
   UploadReport,
 } from "./types.ts";
 
-export interface IsolatedSessionController {
-  promise: Promise<UploadReport>;
+export interface IsolatedSessionController<T = UploadReport> {
+  promise: Promise<T>;
   cancel: (reason?: string) => void;
 }
 
-/**
- * Executes an upload session inside an isolated `Bun.ModuleGraph` with its own
- * `process` environment view and deterministic `graph.dispose()` cancellation.
- */
-export function startIsolatedUploadSession(
-  options: CliOptions,
-  auth: S3AuthConfig,
-  proxy: ProxyConfig,
+function startGraphSession<T>(
   tls: TlsConfig,
   envOverrides: Record<string, string | undefined>,
-  callbacks: UploadCallbacks = {},
-): IsolatedSessionController {
+  callbacks: UploadCallbacks,
+  invoker: (mod: {
+    runInGraph: (
+      o: CliOptions,
+      a: S3AuthConfig,
+      p: ProxyConfig,
+      t: TlsConfig,
+      c: UploadCallbacks,
+    ) => Promise<UploadReport>;
+    runBatchInGraph: (
+      targets: ResolvedUploadTarget[],
+      o: CliOptions,
+      a: S3AuthConfig,
+      p: ProxyConfig,
+      t: TlsConfig,
+      c: UploadCallbacks,
+    ) => Promise<BatchUploadReport>;
+  }) => Promise<T>,
+): IsolatedSessionController<T> {
   const isolatedEnv: Record<string, string | undefined> = {
     ...process.env,
     ...envOverrides,
@@ -58,16 +70,8 @@ export function startIsolatedUploadSession(
 
   const runPromise = (async () => {
     try {
-      const mod = (await graph.import(entryPath)) as {
-        runInGraph: (
-          o: CliOptions,
-          a: S3AuthConfig,
-          p: ProxyConfig,
-          t: TlsConfig,
-          c: UploadCallbacks,
-        ) => Promise<UploadReport>;
-      };
-      return await graph.run(() => mod.runInGraph(options, auth, proxy, tls, callbacks));
+      const mod = (await graph.import(entryPath)) as Parameters<typeof invoker>[0];
+      return await graph.run(() => invoker(mod));
     } finally {
       if (!isDisposed) {
         isDisposed = true;
@@ -87,4 +91,37 @@ export function startIsolatedUploadSession(
   };
 
   return { promise, cancel };
+}
+
+/**
+ * Executes a single-file upload session inside an isolated `Bun.ModuleGraph`.
+ */
+export function startIsolatedUploadSession(
+  options: CliOptions,
+  auth: S3AuthConfig,
+  proxy: ProxyConfig,
+  tls: TlsConfig,
+  envOverrides: Record<string, string | undefined>,
+  callbacks: UploadCallbacks = {},
+): IsolatedSessionController<UploadReport> {
+  return startGraphSession(tls, envOverrides, callbacks, (mod) =>
+    mod.runInGraph(options, auth, proxy, tls, callbacks),
+  );
+}
+
+/**
+ * Executes a multi-file batch upload session inside an isolated `Bun.ModuleGraph`.
+ */
+export function startIsolatedBatchUploadSession(
+  targets: ResolvedUploadTarget[],
+  options: CliOptions,
+  auth: S3AuthConfig,
+  proxy: ProxyConfig,
+  tls: TlsConfig,
+  envOverrides: Record<string, string | undefined>,
+  callbacks: UploadCallbacks = {},
+): IsolatedSessionController<BatchUploadReport> {
+  return startGraphSession(tls, envOverrides, callbacks, (mod) =>
+    mod.runBatchInGraph(targets, options, auth, proxy, tls, callbacks),
+  );
 }
