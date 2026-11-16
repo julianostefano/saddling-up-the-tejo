@@ -4,8 +4,6 @@
 **LinkedIn:** https://www.linkedin.com/in/julianostefano/
 **Repository:** https://github.com/julianostefano/saddling-up-the-tejo
 
-[Português (PT-BR)](README.pt-BR.md) | **English**
-
 ---
 
 ## Overview

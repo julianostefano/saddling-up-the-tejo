@@ -19,7 +19,7 @@ from pypfopt.efficient_frontier import EfficientFrontier
 
 def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
     # ---------------------------------------------------------
-    # 1. Carregamento e Preparação dos Dados
+    # 1. Data Loading and Preparation
     # ---------------------------------------------------------
     stock_prices_df = pd.read_csv(csv_path, index_col="Date")
     stock_prices_df.index = pd.to_datetime(stock_prices_df.index)
@@ -28,31 +28,30 @@ def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
     n_assets = len(tickers)
 
     # ---------------------------------------------------------
-    # 2. Retornos Esperados e Matriz de Covariância Anualizados
+    # 2. Annualized Expected Returns and Sample Covariance Matrix
     # ---------------------------------------------------------
-    # mu: retornos esperados anualizados das ações (média aritmética, compounding=False)
-    # S: matriz de covariância amostral anualizada (fator 252 dias úteis)
+    # mu: annualized expected returns (arithmetic mean, compounding=False)
+    # S: annualized sample covariance matrix (252 trading days)
     mu = expected_returns.mean_historical_return(stock_prices_df, compounding=False)
     S = risk_models.sample_cov(stock_prices_df)
 
     # ---------------------------------------------------------
-    # 3. Questão 1: Portfólio Benchmark (Igualmente Ponderado - 1/N)
+    # 3. Question 1: Benchmark Portfolio (Equally Weighted - 1/N)
     # ---------------------------------------------------------
-    # Cálculo padrão do benchmark (retornos diários anualizados por 252 dias)
-    # Conforme ensinado nos módulos iniciais de Portfolio Analysis:
+    # Standard benchmark calculation using daily returns and 252 trading days:
     daily_returns = stock_prices_df.pct_change().dropna()
-    benchmark_returns = daily_returns.mean(axis=1)  # Pesos iguais (1/5 para cada ação)
+    benchmark_returns = daily_returns.mean(axis=1)  # Equal weights (1/5 per stock)
 
-    # Retorno esperado do portfólio igualmente ponderado (média diária)
+    # Expected return of the equally weighted portfolio (daily mean)
     benchmark_exp_return: float = float(benchmark_returns.mean())
 
-    # Volatilidade anualizada do benchmark
+    # Annualized volatility of the benchmark portfolio
     benchmark_vol: float = float(benchmark_returns.std() * np.sqrt(252))
 
-    # Índice de Sharpe anualizado (taxa livre de risco Rf = 0%)
+    # Annualized Sharpe Ratio (risk-free rate Rf = 0%)
     benchmark_sharpe_ratio: float = float((benchmark_exp_return / benchmark_returns.std()) * np.sqrt(252))
 
-    # Para comparação acadêmica via PyPortfolioOpt (CAGR / geometric mean):
+    # For academic comparison via PyPortfolioOpt (CAGR / geometric mean):
     equal_weights = {ticker: 1.0 / n_assets for ticker in tickers}
     ef_benchmark = EfficientFrontier(mu, S)
     ef_benchmark.set_weights(equal_weights)
@@ -61,7 +60,7 @@ def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
     bench_cagr_sharpe: float = float(bench_perf_cagr[2])
 
     # ---------------------------------------------------------
-    # 4. Questão 2: Portfólio de Mínima Volatilidade (Min Volatility)
+    # 4. Question 2: Minimum Volatility Portfolio
     # ---------------------------------------------------------
     ef_mv = EfficientFrontier(mu, S)
     ef_mv.min_volatility()
@@ -72,7 +71,7 @@ def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
     mv_portfolio_vol: float = float(mv_perf[1])
 
     # ---------------------------------------------------------
-    # 5. Questão 3: Portfólio de Máximo Sharpe (Max Sharpe / Tangência)
+    # 5. Question 3: Maximum Sharpe Ratio Portfolio (Tangency)
     # ---------------------------------------------------------
     ef_ms = EfficientFrontier(mu, S)
     ef_ms.max_sharpe(risk_free_rate=0.0)
@@ -83,7 +82,7 @@ def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
     ms_portfolio_sharpe: float = float(ms_perf[2])
 
     # ---------------------------------------------------------
-    # 6. Exibição e Tabela Comparativa de Resultados
+    # 6. Summary & Comparative Results Table
     # ---------------------------------------------------------
     summary_df = pd.DataFrame(
         {
@@ -115,20 +114,20 @@ def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
     )
 
     print("=" * 65)
-    print("RESUMO DOS PORTFÓLIOS - OTIMIZAÇÃO MÉDIA-VARIANÇA (MARKOWITZ)")
+    print("PORTFOLIO SUMMARY - MEAN-VARIANCE OPTIMIZATION (MARKOWITZ)")
     print("=" * 65)
     print(summary_df)
     print("\n" + "=" * 65)
-    print("PESOS DOS ATIVOS (%)")
+    print("ASSET ALLOCATION WEIGHTS (%)")
     print("=" * 65)
     print((weights_comparison_df * 100).round(2).astype(str) + "%")
 
     # ---------------------------------------------------------
-    # 7. Geração de Gráficos de Nível Profissional para Portfólio
+    # 7. Professional Portfolio Visualizations
     # ---------------------------------------------------------
     plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
 
-    # Gráfico 1: Fronteira Eficiente com Simulação de Monte Carlo
+    # Chart 1: Efficient Frontier with Monte Carlo Simulation
     np.random.seed(42)
     n_simulations = 5000
     sim_returns = []
@@ -153,11 +152,11 @@ def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
         marker="o",
         s=12,
         alpha=0.35,
-        label="Simulações Aleatórias",
+        label="Random Simulations",
     )
-    plt.colorbar(scatter, label="Índice de Sharpe (Rf = 0%)")
+    plt.colorbar(scatter, label="Sharpe Ratio (Rf = 0%)")
 
-    # Plot dos Portfólios de Destaque
+    # Highlight Optimal Portfolios
     ax.scatter(
         benchmark_vol,
         benchmark_exp_return,
@@ -176,7 +175,7 @@ def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
         s=180,
         edgecolor="black",
         linewidth=1.5,
-        label=f"Mínima Volatilidade: Vol={mv_portfolio_vol:.1%}, Ret={mv_perf[0]:.1%}",
+        label=f"Minimum Volatility: Vol={mv_portfolio_vol:.1%}, Ret={mv_perf[0]:.1%}",
     )
     ax.scatter(
         ms_perf[1],
@@ -186,10 +185,10 @@ def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
         s=260,
         edgecolor="black",
         linewidth=1.5,
-        label=f"Máximo Sharpe: Sharpe={ms_portfolio_sharpe:.2f}, Ret={ms_perf[0]:.1%}",
+        label=f"Maximum Sharpe: Sharpe={ms_portfolio_sharpe:.2f}, Ret={ms_perf[0]:.1%}",
     )
 
-    # Plot dos ativos individuais
+    # Plot Individual Assets
     for ticker in tickers:
         asset_vol = np.sqrt(S.loc[ticker, ticker])
         asset_ret = mu[ticker]
@@ -203,20 +202,20 @@ def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
             fontsize=10,
         )
 
-    ax.set_title("Fronteira Eficiente de Markowitz & Alocações Ótimas (FAANG 2020-2023)", fontsize=13, fontweight="bold")
-    ax.set_xlabel("Volatilidade Anualizada (Risco $\\sigma$)", fontsize=11)
-    ax.set_ylabel("Retorno Esperado Anualizado ($E[R]$)", fontsize=11)
+    ax.set_title("Markowitz Efficient Frontier & Optimal Allocations (FAANG 2020-2023)", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Annualized Volatility (Risk $\\sigma$)", fontsize=11)
+    ax.set_ylabel("Annualized Expected Return ($E[R]$)", fontsize=11)
     ax.legend(loc="upper left", frameon=True, framealpha=0.9)
     plt.tight_layout()
     plt.savefig("efficient_frontier.png", dpi=300)
     plt.close()
 
-    # Gráfico 2: Comparação da Alocação de Pesos
+    # Chart 2: Asset Allocation Comparison
     fig, ax = plt.subplots(figsize=(9, 5))
     weights_comparison_df.plot(kind="bar", ax=ax, width=0.8, colormap="tab10")
-    ax.set_title("Comparativo de Alocação de Ativos por Estratégia", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Peso no Portfólio (0.0 a 1.0)", fontsize=11)
-    ax.set_xlabel("Ativos (FAANG)", fontsize=11)
+    ax.set_title("Asset Allocation Comparison by Strategy", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Portfolio Weight (0.0 to 1.0)", fontsize=11)
+    ax.set_xlabel("Assets (FAANG)", fontsize=11)
     ax.set_xticklabels(tickers, rotation=0, fontweight="bold")
     ax.set_ylim(0, 1.05)
     for p in ax.patches:
@@ -230,12 +229,12 @@ def run_portfolio_analysis(csv_path: str = "faang_stocks.csv"):
                 fontsize=8.5,
                 rotation=0,
             )
-    ax.legend(title="Estratégia", frameon=True)
+    ax.legend(title="Strategy", frameon=True)
     plt.tight_layout()
     plt.savefig("portfolio_allocation_comparison.png", dpi=300)
     plt.close()
 
-    print("\nGráficos salvos com sucesso: 'efficient_frontier.png' e 'portfolio_allocation_comparison.png'")
+    print("\nCharts successfully saved: 'efficient_frontier.png' and 'portfolio_allocation_comparison.png'")
 
     return {
         "benchmark_exp_return": benchmark_exp_return,
