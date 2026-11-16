@@ -11,15 +11,16 @@ Operational CLI and TUI utilities designed for production database migrations, O
 ```text
 tools/
 ├── README.md
-├── bun-s3-uploader/                    # Zero-dependency native Bun S3 Uploader CLI & TUI
+├── bun-bucket/                         # Zero-dependency native Bun S3 CLI & TUI (Upload & Download)
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── README.md
 │   ├── src/
 │   │   ├── index.ts                    # Entrypoint dispatching CLI vs. interactive TUI
 │   │   ├── cli.ts                      # Argument parser, progress bar, overwrite prompt, JSON mode
-│   │   ├── tui.ts                      # Native ANSI raw-mode TUI with file browser & dashboard
+│   │   ├── tui.ts                      # Native ANSI raw-mode TUI (upload/download, file browser, dashboard)
 │   │   ├── uploader.ts                 # Single-part & multipart S3 uploader + SSE-KMS verification
+│   │   ├── downloader.ts               # S3 downloader (single file & S3Client.list + Bun.Glob wildcards)
 │   │   ├── shell.ts                    # Bun.$ path inspection & Bun.Glob wildcard/dir resolver
 │   │   ├── hasher.ts                   # Main-thread Worker wrapper for checksum calculation
 │   │   ├── workers/hash-worker.ts      # Background Worker computing SHA-256, MD5, multipart ETag
@@ -37,57 +38,62 @@ tools/
 
 ---
 
-## Tool 1: Bun Native S3 Uploader
+## Tool 1: Bun Bucket (`bun-bucket`)
 
-**Location:** [`bun-s3-uploader/`](./bun-s3-uploader/) · [Full Documentation](./bun-s3-uploader/README.md)
+**Location:** [`bun-bucket/`](./bun-bucket/) · [Full Documentation](./bun-bucket/README.md)
 
-A standalone, zero-runtime-dependency S3 transfer utility built exclusively with **Bun's native APIs** (`Bun.S3Client`, `Bun.$`, `Bun.Glob`, `Worker`, `Bun.CryptoHasher`, `Bun.ModuleGraph`). Designed for large database dumps (`.DMP`), backups, and directory trees over corporate proxies or self-signed endpoints.
+A standalone, zero-runtime-dependency S3 upload & download utility built exclusively with **Bun's native APIs** (`Bun.S3Client`, `Bun.$`, `Bun.Glob`, `Worker`, `Bun.CryptoHasher`, `Bun.ModuleGraph`). Designed for large database dumps (`.DMP`), backups, and directory trees over corporate proxies or self-signed endpoints.
 
 ### Architecture Overview
 
 | Module | Responsibility |
 | --- | --- |
-| [`src/index.ts`](./bun-s3-uploader/src/index.ts) | Entrypoint routing between non-interactive CLI and interactive TTY TUI |
-| [`src/cli.ts`](./bun-s3-uploader/src/cli.ts) | Positional & flag parser (including bash-expanded wildcards), progress bar, interactive overwrite prompt, `--json` output |
-| [`src/tui.ts`](./bun-s3-uploader/src/tui.ts) | Full-screen ANSI raw-mode TUI with `$ ls -l` directory browser, overwrite modal, and transfer dashboard |
-| [`src/uploader.ts`](./bun-s3-uploader/src/uploader.ts) | File size analysis, Single-Part (`s3File.write`) vs. concurrent Multipart (`s3File.writer`), `exists()` checks, `SHA-256` & SSE-KMS verification |
-| [`src/shell.ts`](./bun-s3-uploader/src/shell.ts) | Cross-platform `Bun.$` inspection (`dirname`, `basename`, `ls -l`), `Bun.Glob` recursion, automatic `${path}*` fallback, folder suffixing |
-| [`src/hasher.ts`](./bun-s3-uploader/src/hasher.ts) & [`src/workers/hash-worker.ts`](./bun-s3-uploader/src/workers/hash-worker.ts) | Background `Worker` thread streaming `SHA-256`, `MD5`, and AWS S3 multipart `ETag` hashes |
-| [`src/session-runner.ts`](./bun-s3-uploader/src/session-runner.ts) & [`src/isolated-entry.ts`](./bun-s3-uploader/src/isolated-entry.ts) | Isolated `Bun.ModuleGraph` execution with scoped `process.env` and `graph.dispose()` cancellation |
-| [`src/env.ts`](./bun-s3-uploader/src/env.ts) | `S3_*`/`AWS_*` credential checks, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` CIDR/wildcard evaluation, `NODE_TLS_REJECT_UNAUTHORIZED` |
-| [`src/format.ts`](./bun-s3-uploader/src/format.ts) & [`src/metrics.ts`](./bun-s3-uploader/src/metrics.ts) | `normalizeS3Target`, byte/speed/ETA formatting, EMA-smoothed throughput & bandwidth utilization |
+| [`src/index.ts`](./bun-bucket/src/index.ts) | Entrypoint routing between non-interactive CLI and interactive TTY TUI |
+| [`src/cli.ts`](./bun-bucket/src/cli.ts) | Positional & flag parser (`upload`/`download` auto-detection, globs), progress bar, overwrite prompt, `--json` output |
+| [`src/tui.ts`](./bun-bucket/src/tui.ts) | Full-screen ANSI raw-mode TUI with Upload/Download mode toggle, `$ ls -l` directory browser, overwrite modal, and dashboard |
+| [`src/uploader.ts`](./bun-bucket/src/uploader.ts) | File size analysis, Single-Part (`s3File.write`) vs. concurrent Multipart (`s3File.writer`), `exists()` checks, `SHA-256` & SSE-KMS verification |
+| [`src/downloader.ts`](./bun-bucket/src/downloader.ts) | `S3Client.prototype.list()` + `Bun.Glob` wildcard/prefix resolution, streaming downloads, local overwrite protection, Worker `SHA-256` verification |
+| [`src/shell.ts`](./bun-bucket/src/shell.ts) | Cross-platform `Bun.$` inspection (`dirname`, `basename`, `ls -l`), `Bun.Glob` recursion, automatic `${path}*` fallback, folder suffixing |
+| [`src/hasher.ts`](./bun-bucket/src/hasher.ts) & [`src/workers/hash-worker.ts`](./bun-bucket/src/workers/hash-worker.ts) | Background `Worker` thread streaming `SHA-256`, `MD5`, and AWS S3 multipart `ETag` hashes |
+| [`src/session-runner.ts`](./bun-bucket/src/session-runner.ts) & [`src/isolated-entry.ts`](./bun-bucket/src/isolated-entry.ts) | Isolated `Bun.ModuleGraph` execution with scoped `process.env` and `graph.dispose()` cancellation |
+| [`src/env.ts`](./bun-bucket/src/env.ts) | `S3_*`/`AWS_*` credential checks, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY` CIDR/wildcard evaluation, `NODE_TLS_REJECT_UNAUTHORIZED` |
+| [`src/format.ts`](./bun-bucket/src/format.ts) & [`src/metrics.ts`](./bun-bucket/src/metrics.ts) | `normalizeS3Target`, byte/speed/ETA formatting, EMA-smoothed throughput & bandwidth utilization |
 
 ### Key Capabilities
 
-- **Adaptive Single-Part vs. Multipart Upload**: Evaluates file size against `--multipart-threshold` (default `5 MiB`) and switches to concurrent S3 Multipart Upload (`S3File.writer`) with configurable `--part-size` (`5 MiB`–`5 GiB`), `--queue-size` (`1`–`255`), and `--retry` (`0`–`255`).
+- **Bidirectional S3 Transfers (Single File & Wildcards)**:
+  - **Upload (`Local -> S3`)**: Evaluates file size against `--multipart-threshold` (default `5 MiB`) and switches to concurrent S3 Multipart Upload (`S3File.writer`) with configurable `--part-size` (`5 MiB`–`5 GiB`), `--queue-size` (`1`–`255`), and `--retry` (`0`–`255`).
+  - **Download (`S3 -> Local`)**: Automatically enabled when source begins with `s3://` or passed via `download` / `-d` / `--download`; downloads single objects (`s3File.stream()`) or lists and filters remote keys with `S3Client.prototype.list()` + `Bun.Glob` for wildcard patterns (`*.DMP`, `**/*.js`, or folder prefixes).
 - **Smart Target Normalization & Wildcard Expansion**:
   - Accepts `s3://bucket/prefix/`, bare `bucket/prefix/`, or `<bucket> <key>` arguments.
-  - Appends local filenames automatically when targeting a folder prefix (`dumps/20261116/` or `dumps/20261116`).
+  - Appends local filenames automatically when uploading to a folder prefix (`dumps/20261116/` or `dumps/20261116`).
   - Supports quoted globs (`"./dumps/**/*.DMP"`), bash-expanded multi-file positional arguments (`./dumps/CLBP_* s3://bucket/prefix/`), recursive directories, and automatic `${path}*` wildcard fallback.
-- **Overwrite Protection**: Checks `s3File.exists()` and `s3File.stat()` before transfer; prompts `[y]es / [N]o (skip) / [a]ll / [s]kip all / [q]uit` in interactive sessions and refuses silent overwrites in non-TTY scripts unless `--yes` / `--overwrite` or `--skip-existing` is passed.
-- **Integrity & SSE-KMS Compatibility**: Computes local `SHA-256`, `MD5`, and multipart `ETag` in a `Worker` thread, validates remote size & multipart part counts even on **SSE-KMS** encrypted buckets (where cipher ETags differ from plaintext MD5), and streams back the object for full `SHA-256` verification (`--verify full`).
+- **Overwrite Protection (Upload & Download)**: Checks remote objects before upload and local files before download; prompts `[y]es / [N]o (skip) / [a]ll / [s]kip all / [q]uit` in interactive sessions and refuses silent overwrites in non-TTY scripts unless `--yes` / `--overwrite` or `--skip-existing` is passed.
+- **Integrity & SSE-KMS Compatibility**: Computes local `SHA-256`, `MD5`, and multipart `ETag` in a `Worker` thread, validates size & multipart part counts even on **SSE-KMS** encrypted buckets (where cipher ETags differ from plaintext MD5), and performs full streaming `SHA-256` verification (`--verify full`).
 - **Enterprise Proxy & TLS Support**: Automatically routes through `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` respecting `NO_PROXY`, and supports invalid/self-signed certificates via `-k` / `--insecure` (`NODE_TLS_REJECT_UNAUTHORIZED=0`).
-- **Standalone Linux x64 Binary**: Cross-compiles (`bun run build:linux-x64`) into a self-contained binary bundling the CLI, Worker, and `ModuleGraph` entrypoints.
+- **Standalone Linux x64 Binary**: Cross-compiles (`bun run build:linux-x64`) into `./dist/bun-bucket-linux-x64` bundling the CLI, Worker, and `ModuleGraph` entrypoints.
 
 ### CLI Options Reference
 
 | Category | Flag(s) | Description | Default |
 | --- | --- | --- | --- |
+| Direction | `-u`, `--upload` / `-d`, `--download` | Force transfer direction (auto-detected if source starts with `s3://`) | `upload` |
+| Output | `-o`, `--output <dir\|file>` | Local destination directory or file path for downloads | `.` |
 | Target | `-f`, `--file <path\|dir\|glob>` | Local file, directory, or glob pattern (repeatable) | *(positional)* |
-| Target | `-b`, `--bucket <name>` | Destination S3 bucket | `S3_BUCKET` / `AWS_BUCKET` |
-| Target | `--key`, `--prefix <key>` | Object key or key prefix for batch uploads | File basename / relative path |
-| Target | `--dot`, `--include-hidden` | Include dotfiles in directory/glob scans | `false` |
+| Target | `-b`, `--bucket <name>` | S3 bucket (or `bucket/prefix`) | `S3_BUCKET` / `AWS_BUCKET` |
+| Target | `--key`, `--prefix <pattern>` | Remote object key, prefix, or wildcard glob (`*`, `?`, `[...]`) | File basename / relative path |
+| Target | `--dot`, `--include-hidden` | Include dotfiles/keys in directory/glob scans | `false` |
 | Target | `-e`, `--endpoint <url>` | Custom S3-compatible endpoint URL | `S3_ENDPOINT` / `AWS_ENDPOINT` |
 | Target | `-r`, `--region <region>` | AWS region | `us-east-1` |
 | S3 Meta | `--virtual-hosted-style`, `--acl`, `--storage-class`, `--request-payer` | S3 URL style, ACL, storage class, requester-pays header | AWS defaults |
-| Overwrite | `-y`, `--yes`, `--overwrite` | Overwrite existing objects without prompting | Prompt (`ask`) |
-| Overwrite | `--skip-existing`, `--no-overwrite` | Skip existing objects without overwriting | Prompt (`ask`) |
+| Overwrite | `-y`, `--yes`, `--overwrite` | Overwrite existing remote objects or local files without prompting | Prompt (`ask`) |
+| Overwrite | `--skip-existing`, `--no-overwrite` | Skip existing remote objects or local files without overwriting | Prompt (`ask`) |
 | Transfer | `--part-size <size>` | Multipart chunk size (`5MiB`..`5GiB`) | `5MiB` |
 | Transfer | `--multipart-threshold <size>` | File size threshold to trigger multipart upload | `5MiB` |
 | Transfer | `--queue-size <n>` | Concurrent multipart upload requests (`1`..`255`) | `4` |
 | Transfer | `--retry <n>` | Retry attempts per request (`0`..`255`) | `3` |
 | Transfer | `--link-mbps <n>` | Link speed in Mbps for bandwidth `%` telemetry | `1000` |
-| Security | `--verify <full\|stat\|none>` | Post-upload integrity verification mode | `full` |
+| Security | `--verify <full\|stat\|none>` | Integrity verification mode | `full` |
 | Security | `--proxy <url>` | Explicit HTTP/HTTPS proxy URL | Env `HTTPS_PROXY`/`HTTP_PROXY` |
 | Security | `-k`, `--insecure`, `--allow-invalid-certs`, `--strict-tls` | Allow or enforce strict TLS certificate checks | Strict TLS |
 | Runtime | `--isolated`, `--tui`, `--dry-run`, `--json`, `-h`, `-v` | Isolated `ModuleGraph`, TUI mode, dry run, JSON report | CLI mode |
@@ -100,7 +106,7 @@ A standalone, zero-runtime-dependency S3 transfer utility built exclusively with
 | `S3_SECRET_ACCESS_KEY` | `AWS_SECRET_ACCESS_KEY` | Secret access key (required) |
 | `S3_REGION` | `AWS_REGION` | Region (defaults to `us-east-1`) |
 | `S3_ENDPOINT` | `AWS_ENDPOINT` | Custom S3-compatible endpoint |
-| `S3_BUCKET` | `AWS_BUCKET` | Default destination bucket |
+| `S3_BUCKET` | `AWS_BUCKET` | Default S3 bucket |
 | `S3_SESSION_TOKEN` | `AWS_SESSION_TOKEN` | Temporary STS session token |
 | `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | lowercase variants | Proxy URL |
 | `NO_PROXY` | `no_proxy` | Comma/space-separated proxy bypass rules |
@@ -113,7 +119,13 @@ A standalone, zero-runtime-dependency S3 transfer utility built exclusively with
 bun run src/index.ts /dumps/CLBP_CRT_261112_01.DMP my-bucket/dumps/20261116/
 
 # Upload multiple wildcard-matched dumps (quoted glob or bash-expanded) with proxy & self-signed TLS
-./bun-s3-upload-linux-x64 /dumps/CLBP_CRT_261112_* s3://my-bucket/dumps/20261116/ --insecure --yes
+./bun-bucket-linux-x64 /dumps/CLBP_CRT_261112_* s3://my-bucket/dumps/20261116/ --insecure --yes
+
+# Download a single file or wildcard batch from S3 (auto-detected via s3:// prefix)
+./bun-bucket-linux-x64 "s3://my-bucket/dumps/20261116/*.DMP" ./local-restore/ --skip-existing
+
+# Download using the explicit `download` subcommand without `s3://`
+./bun-bucket-linux-x64 download my-bucket/dumps/20261116/CLBP_CRT_261112_01.DMP ./restore/
 
 # Launch interactive TUI
 bun run tui
@@ -173,8 +185,8 @@ export AWS_SECRET_ACCESS_KEY="..."
 export AWS_REGION="sa-east-1"
 export HTTPS_PROXY="http://proxy.corp:3000"
 
-./bun-s3-upload-linux-x64 /storage/dumps/CLBP_CRT_* s3://db-backups-bucket/dumps/20261116/ --skip-existing
-./bun-s3-upload-linux-x64 /storage/dumps/clbp_export_summary.csv s3://db-backups-bucket/dumps/20261116/ --yes
+./bun-bucket-linux-x64 /storage/dumps/CLBP_CRT_* s3://db-backups-bucket/dumps/20261116/ --skip-existing
+./bun-bucket-linux-x64 /storage/dumps/clbp_export_summary.csv s3://db-backups-bucket/dumps/20261116/ --yes
 ```
 
 ---
@@ -182,8 +194,8 @@ export HTTPS_PROXY="http://proxy.corp:3000"
 ## Verification & Testing
 
 ```bash
-# Validate Bun S3 Uploader types and full test suite (28 unit + integration tests)
-cd tools/bun-s3-uploader
+# Validate Bun Bucket types and full test suite (unit + integration tests)
+cd tools/bun-bucket
 bun install
 AGENT=1 bun check --no-script
 bun test --check

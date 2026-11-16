@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   DEFAULT_LINK_SPEED_MBPS,
   DEFAULT_MULTIPART_THRESHOLD,
@@ -23,7 +24,14 @@ import {
   validateAndResolveAuth,
 } from "./env.ts";
 import {
+  executeBatchDownload,
+  executeS3Download,
+  resolveDownloadTargets,
+} from "./downloader.ts";
+import {
+  startIsolatedBatchDownloadSession,
   startIsolatedBatchUploadSession,
+  startIsolatedDownloadSession,
   startIsolatedUploadSession,
 } from "./session-runner.ts";
 import { hasGlobPattern, resolveUploadTargets } from "./shell.ts";
@@ -34,15 +42,17 @@ import type {
   OverwriteDecision,
   OverwritePromptInfo,
   ProgressSnapshot,
+  ResolvedDownloadTarget,
   ResolvedUploadTarget,
   S3Acl,
   S3StorageClass,
+  TransferOperation,
   UploadCallbacks,
   UploadReport,
   VerifyMode,
 } from "./types.ts";
 
-export const APP_VERSION = "1.0.0";
+export const APP_VERSION = "1.1.0";
 
 const VALID_VERIFY_MODES = new Set<VerifyMode>(["full", "stat", "none"]);
 const VALID_ACLS = new Set<S3Acl>([
@@ -71,19 +81,31 @@ const VALID_STORAGE_CLASSES = new Set<S3StorageClass>([
 
 export function getHelpText(): string {
   return `
-Bun Native S3 Uploader v${APP_VERSION}
+Bun Bucket v${APP_VERSION} — Native Bun S3 Uploader & Downloader
 
-Usage:
-  bun run src/index.ts <file-dir-or-glob> <bucket> [key-or-prefix] [options]
-  bun run src/index.ts <file-dir-or-glob> s3://<bucket>/<prefix> [options]
-  bun run src/index.ts --file <path|dir|glob> --bucket <name> [options]
-  bun run src/index.ts --tui
+Usage (Upload: Local -> S3):
+  bun-bucket [upload] <file-dir-or-glob> <bucket> [key-or-prefix] [options]
+  bun-bucket [upload] <file-dir-or-glob> s3://<bucket>/<prefix> [options]
+  bun-bucket [upload] --file <path|dir|glob> --bucket <name> [options]
 
-Target & File Options:
+Usage (Download: S3 -> Local):
+  bun-bucket download <s3://bucket/key-or-glob> [local-dest] [options]
+  bun-bucket download <bucket>/<key-or-glob> [local-dest] [options]
+  bun-bucket download <bucket> <key-or-glob> [local-dest] [options]
+  bun-bucket <s3://bucket/key-or-glob> [local-dest] [options]
+  bun-bucket --download --bucket <name> --key <key-or-glob> [--output <dir-or-file>]
+
+Interactive Terminal UI:
+  bun-bucket --tui
+
+Direction & Path Options:
+  -u, --upload                   Force upload mode (Local -> S3, default when source is local)
+  -d, --download                 Force download mode (S3 -> Local, auto-detected for s3:// source)
+  -o, --output <dir-or-file>     Local destination directory or file path for downloads (default: .)
   -f, --file <path|dir|glob>     Local file, directory (recursive), or wildcard pattern (repeatable)
-  -b, --bucket <name>            Destination S3 bucket (fallback: S3_BUCKET / AWS_BUCKET)
-      --key, --prefix <key>      Object key (single file) or key prefix (directory/wildcard/multi-file)
-      --dot, --include-hidden    Include hidden dotfiles when scanning directories or wildcards
+  -b, --bucket <name>            S3 bucket (or bucket/prefix; fallback: S3_BUCKET / AWS_BUCKET)
+      --key, --prefix <pattern>  Object key, prefix, or wildcard glob (*, ?, [...], {...})
+      --dot, --include-hidden    Include hidden dotfiles/keys when scanning directories or wildcards
   -e, --endpoint <url>           S3-compatible endpoint URL (fallback: S3_ENDPOINT / AWS_ENDPOINT)
   -r, --region <region>          AWS region (fallback: S3_REGION / AWS_REGION, default: us-east-1)
       --virtual-hosted-style     Use virtual hosted-style S3 URLs
@@ -92,9 +114,9 @@ Target & File Options:
       --request-payer            Set x-amz-request-payer for requester-pays buckets
 
 Overwrite Protection Options:
-  -y, --yes, --overwrite         Overwrite existing S3 objects without prompting
+  -y, --yes, --overwrite         Overwrite existing S3 objects or local files without prompting
       --skip-existing, --no-overwrite
-                                 Skip existing S3 objects without overwriting
+                                 Skip existing S3 objects or local files without overwriting
 
 Multipart & Transfer Options:
       --part-size <size>         Multipart chunk size, 5MiB..5GiB (default: 5MiB)
@@ -111,9 +133,9 @@ Integrity, Proxy & TLS Options:
       --strict-tls               Enforce strict TLS certificate verification
 
 Execution & Output Options:
-      --isolated                 Run upload inside an isolated Bun.ModuleGraph session
+      --isolated                 Run transfer inside an isolated Bun.ModuleGraph session
       --tui                      Launch interactive Terminal UI
-      --dry-run                  Analyze files, validate env/proxy/TLS, and compute SHA-256 without uploading
+      --dry-run                  Analyze targets, validate env/proxy/TLS without transferring data
       --json                     Print final structured JSON report
   -h, --help                     Show this help message
   -v, --version                  Show version
@@ -127,11 +149,29 @@ Environment Variables:
 `.trim();
 }
 
+function looksLikeLocalDestPath(val: string): boolean {
+  if (
+    val === "." ||
+    val === ".." ||
+    val.startsWith("./") ||
+    val.startsWith("../") ||
+    val.startsWith(".\\") ||
+    val.startsWith("..\\")
+  ) {
+    return true;
+  }
+  if (val.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(val)) {
+    return true;
+  }
+  return existsSync(val);
+}
+
 /**
  * Parses CLI arguments into structured options without external dependencies.
  */
 export function parseCliArgs(argv: string[]): CliOptions {
   const options: CliOptions = {
+    operation: "upload",
     filePaths: [],
     partSize: DEFAULT_PART_SIZE,
     multipartThreshold: DEFAULT_MULTIPART_THRESHOLD,
@@ -149,6 +189,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
     version: false,
   };
 
+  let explicitOperation: TransferOperation | undefined;
   let explicitOverwrite = false;
   let explicitSkip = false;
   const positionals: string[] = [];
@@ -181,6 +222,16 @@ export function parseCliArgs(argv: string[]): CliOptions {
       case "-v":
       case "--version":
         options.version = true;
+        break;
+      case "-u":
+      case "--upload":
+        explicitOperation = "upload";
+        options.operation = "upload";
+        break;
+      case "-d":
+      case "--download":
+        explicitOperation = "download";
+        options.operation = "download";
         break;
       case "--tui":
         options.tui = true;
@@ -228,6 +279,13 @@ export function parseCliArgs(argv: string[]): CliOptions {
         const res = readValue(i, flag, inlineVal);
         options.filePaths!.push(res.value);
         if (!options.filePath) options.filePath = res.value;
+        i = res.nextIdx;
+        break;
+      }
+      case "-o":
+      case "--output": {
+        const res = readValue(i, flag, inlineVal);
+        options.outputPath = res.value;
         i = res.nextIdx;
         break;
       }
@@ -350,6 +408,22 @@ export function parseCliArgs(argv: string[]): CliOptions {
     throw new Error("Cannot combine --yes/--overwrite with --skip-existing/--no-overwrite.");
   }
 
+  // Handle optional `upload` or `download` subcommand as first positional argument
+  if (
+    !explicitOperation &&
+    positionals.length > 0 &&
+    (positionals[0] === "download" || positionals[0] === "upload") &&
+    !existsSync(positionals[0]!)
+  ) {
+    explicitOperation = positionals.shift() as TransferOperation;
+    options.operation = explicitOperation;
+  }
+
+  // Auto-detect download when the first positional source begins with `s3://`
+  if (!explicitOperation && positionals.length > 0 && /^s3:\/\//i.test(positionals[0]!)) {
+    options.operation = "download";
+  }
+
   const applyTargetString = (targetStr: string) => {
     const parsed = normalizeS3Target(targetStr);
     options.bucket = parsed.bucket;
@@ -362,7 +436,41 @@ export function parseCliArgs(argv: string[]): CliOptions {
     }
   };
 
-  // Assign positional arguments, including shell-expanded wildcards (<file1> <file2> ... <target>)
+  if (options.operation === "download") {
+    if (positionals.length > 0) {
+      if (!options.bucket) {
+        const first = positionals.shift()!;
+        if (hasGlobPattern(first) && !/^s3:\/\//i.test(first) && !first.includes("/")) {
+          // Bare glob such as "*.DMP" uses configured S3_BUCKET / AWS_BUCKET
+          options.key = options.key ?? first;
+        } else {
+          applyTargetString(first);
+          if (first.trim().endsWith("/") && !options.key) {
+            options.key = "*";
+          }
+        }
+      }
+
+      if (positionals.length > 0 && !options.key) {
+        const next = positionals[0]!;
+        if (positionals.length >= 2 || (!looksLikeLocalDestPath(next) && next !== options.outputPath)) {
+          options.key = positionals.shift();
+        }
+      }
+
+      if (positionals.length > 0 && !options.outputPath) {
+        options.outputPath = positionals.shift();
+      }
+    }
+
+    if (positionals.length > 0) {
+      throw new Error(`Unexpected extra positional arguments: ${positionals.join(" ")}`);
+    }
+
+    return options;
+  }
+
+  // Assign upload positional arguments, including shell-expanded wildcards (<file1> <file2> ... <target>)
   // and targets provided without an explicit `s3://` prefix.
   if (positionals.length > 0 && options.filePaths!.length === 0) {
     if (positionals.length === 1) {
@@ -442,9 +550,11 @@ function formatProgressLine(snap: ProgressSnapshot): string {
       ? "SHA-256  "
       : snap.phase === "uploading"
         ? "UPLOAD   "
-        : snap.phase === "verifying"
-          ? "VERIFY   "
-          : snap.phase.toUpperCase().padEnd(9, " ");
+        : snap.phase === "downloading"
+          ? "DOWNLOAD "
+          : snap.phase === "verifying"
+            ? "VERIFY   "
+            : snap.phase.toUpperCase().padEnd(9, " ");
 
   const bar = renderProgressBar(snap.percent, 22);
   const transferred = `${formatBytes(snap.bytesProcessed)}/${formatBytes(snap.totalBytes)}`;
@@ -469,10 +579,17 @@ async function promptCliOverwrite(info: OverwritePromptInfo): Promise<OverwriteD
   }
   remoteMetaParts.push(`local size: ${formatBytes(info.localSizeBytes)}`);
 
-  process.stdout.write(
-    `\nObject "s3://${info.bucket}/${info.key}" already exists (${remoteMetaParts.join(", ")}).\n` +
-      `Overwrite? [y]es / [N]o (skip) / [a]ll / [s]kip all / [q]uit: `,
-  );
+  if (info.direction === "download") {
+    process.stdout.write(
+      `\nLocal file "${info.localPath}" already exists (${remoteMetaParts.join(", ")}).\n` +
+        `Overwrite local file? [y]es / [N]o (skip) / [a]ll / [s]kip all / [q]uit: `,
+    );
+  } else {
+    process.stdout.write(
+      `\nObject "s3://${info.bucket}/${info.key}" already exists (${remoteMetaParts.join(", ")}).\n` +
+        `Overwrite? [y]es / [N]o (skip) / [a]ll / [s]kip all / [q]uit: `,
+    );
+  }
 
   const answer = await new Promise<string>((resolveAnswer) => {
     let buf = "";
@@ -497,24 +614,35 @@ async function promptCliOverwrite(info: OverwritePromptInfo): Promise<OverwriteD
 }
 
 function printSingleReportSummary(report: UploadReport, options: CliOptions): void {
+  const isDownload = report.operation === "download";
+  const verbLabel = isDownload ? "Download" : "Upload";
   console.log("");
   console.log("=== Transfer & Integrity Summary ===");
   if (report.skipped) {
     console.log("Status:           SKIPPED");
-    console.log(`Object:           s3://${report.bucket}/${report.key}`);
-    console.log(`Reason:           ${report.skipReason ?? "Object already exists"}`);
+    if (isDownload && report.localPath) {
+      console.log(`Source:           s3://${report.bucket}/${report.key}`);
+      console.log(`Local File:       ${report.localPath}`);
+    } else {
+      console.log(`Object:           s3://${report.bucket}/${report.key}`);
+    }
+    console.log(`Reason:           ${report.skipReason ?? "Target already exists"}`);
     return;
   }
 
   console.log(`Status:           ${report.success ? "SUCCESS" : "FAILED"}`);
+  console.log(`Operation:        ${verbLabel.toUpperCase()}`);
   console.log(`Object:           s3://${report.bucket}/${report.key}`);
+  if (isDownload && report.localPath) {
+    console.log(`Local File:       ${report.localPath}`);
+  }
   console.log(
-    `Upload Strategy:  ${report.upload.strategy.toUpperCase()} (${report.upload.partsUploaded} part(s))`,
+    `${verbLabel} Strategy:  ${report.upload.strategy.toUpperCase()} (${report.upload.partsUploaded} part(s))`,
   );
   if (!options.dryRun) {
-    console.log(`Upload Duration:  ${formatDurationMs(report.upload.durationMs)}`);
+    console.log(`${verbLabel} Duration:  ${formatDurationMs(report.upload.durationMs)}`);
     console.log(
-      `Upload Speed:     avg ${formatSpeed(report.upload.avgSpeedBytesPerSec)} | peak ${formatSpeed(report.upload.peakSpeedBytesPerSec)}`,
+      `${verbLabel} Speed:     avg ${formatSpeed(report.upload.avgSpeedBytesPerSec)} | peak ${formatSpeed(report.upload.peakSpeedBytesPerSec)}`,
     );
     console.log(
       `Bandwidth Used:   ${formatBandwidth(report.upload.avgBandwidthMbps)} (${report.upload.bandwidthUtilizationPct.toFixed(1)}% of ${options.linkSpeedMbps} Mbps link)`,
@@ -538,7 +666,7 @@ function printSingleReportSummary(report: UploadReport, options: CliOptions): vo
             : "MISMATCH";
       console.log(`Remote ETag:      ${report.verification.remoteEtag} (${etagStatus})`);
     }
-    if (report.verification.remoteSha256Hex) {
+    if (report.verification.remoteSha256Hex && !isDownload) {
       console.log(
         `Remote SHA-256:   ${report.verification.remoteSha256Hex} (${report.verification.sha256Match ? "MATCH" : "MISMATCH"})`,
       );
@@ -554,29 +682,37 @@ function printSingleReportSummary(report: UploadReport, options: CliOptions): vo
 }
 
 function printBatchReportSummary(batch: BatchUploadReport): void {
+  const isDownload = batch.operation === "download";
+  const countVerb = isDownload ? "downloaded" : "uploaded";
+  const volLabel = isDownload ? "Downloaded Vol:" : "Uploaded Volume:";
   console.log("");
   console.log("=== Batch Transfer Summary ===");
   console.log(`Status:           ${batch.success ? "SUCCESS" : "FAILED"}`);
+  console.log(`Operation:        ${isDownload ? "DOWNLOAD" : "UPLOAD"}`);
   console.log(`Bucket:           s3://${batch.bucket}`);
   console.log(
-    `Files:            ${batch.totalFiles} total | ${batch.uploadedCount} uploaded | ${batch.skippedCount} skipped | ${batch.failedCount} failed`,
+    `Files:            ${batch.totalFiles} total | ${batch.uploadedCount} ${countVerb} | ${batch.skippedCount} skipped | ${batch.failedCount} failed`,
   );
-  console.log(`Uploaded Volume:  ${formatBytes(batch.uploadedBytes)} / ${formatBytes(batch.totalBytes)}`);
+  console.log(`${volLabel.padEnd(18, " ")}${formatBytes(batch.uploadedBytes)} / ${formatBytes(batch.totalBytes)}`);
   console.log(`Total Duration:   ${formatDurationMs(batch.durationMs)}`);
   console.log(`Average Speed:    ${formatSpeed(batch.avgSpeedBytesPerSec)}`);
   console.log(`Average BW Used:  ${formatBandwidth(batch.avgBandwidthMbps)}`);
   console.log("");
   for (const r of batch.results) {
     const tag = r.skipped ? "[SKIP]" : r.success ? "[OK]  " : "[FAIL]";
+    const targetDesc =
+      isDownload && r.localPath
+        ? `s3://${r.bucket}/${r.key} -> ${r.localPath}`
+        : `s3://${r.bucket}/${r.key}`;
     const detail = r.skipped
       ? r.skipReason ?? "skipped"
       : `${formatBytes(r.fileAnalysis.sizeBytes)} | ${r.upload.strategy} | SHA-256 ${r.checksum.sha256Hex.slice(0, 12)}...`;
-    console.log(`  ${tag} s3://${r.bucket}/${r.key} (${detail})`);
+    console.log(`  ${tag} ${targetDesc} (${detail})`);
   }
 }
 
 /**
- * Runs the CLI upload workflow and returns an exit code (0 on success, 1 on failure).
+ * Runs the CLI upload/download workflow and returns an exit code (0 on success, 1 on failure).
  */
 export async function runCli(
   argv: string[],
@@ -597,10 +733,11 @@ export async function runCli(
   }
 
   if (options.version) {
-    console.log(`bun-s3-uploader v${APP_VERSION} (Bun ${Bun.version})`);
+    console.log(`bun-bucket v${APP_VERSION} (Bun ${Bun.version})`);
     return 0;
   }
 
+  const isDownload = options.operation === "download";
   const inputPatterns = options.filePaths?.length
     ? options.filePaths
     : options.filePath
@@ -608,8 +745,13 @@ export async function runCli(
       : [];
 
   const missingInputs: string[] = [];
-  if (inputPatterns.length === 0) {
+  if (!isDownload && inputPatterns.length === 0) {
     missingInputs.push("Missing input path (<file-dir-or-glob> or --file <path>).");
+  }
+  if (isDownload && !options.bucket && !options.key) {
+    missingInputs.push(
+      "Missing remote source (<s3://bucket/key-or-glob>, <bucket>/<key-or-glob>, or --key <pattern>).",
+    );
   }
 
   const validation = validateAndResolveAuth(options);
@@ -644,11 +786,24 @@ export async function runCli(
   const proxy = resolveAndApplyProxy(targetOrigin, options.proxy);
   const tls = resolveAndApplyTls(options);
 
-  let targets: ResolvedUploadTarget[];
+  let uploadTargets: ResolvedUploadTarget[] = [];
+  let downloadTargets: ResolvedDownloadTarget[] = [];
+
   try {
-    targets = await resolveUploadTargets(inputPatterns, options.key, {
-      includeHidden: options.includeHidden,
-    });
+    if (isDownload) {
+      downloadTargets = await resolveDownloadTargets(
+        options,
+        auth,
+        proxy,
+        tls,
+        options.key,
+        options.outputPath,
+      );
+    } else {
+      uploadTargets = await resolveUploadTargets(inputPatterns, options.key, {
+        includeHidden: options.includeHidden,
+      });
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (options.json) {
@@ -661,20 +816,32 @@ export async function runCli(
 
   const isTty = Boolean(process.stdout.isTTY) && !options.json;
   const isInteractiveStdin = Boolean(process.stdin.isTTY) && isTty;
-  const totalBatchBytes = targets.reduce((acc, t) => acc + t.sizeBytes, 0);
 
   if (!options.json) {
-    console.log("=== Bun Native S3 Uploader ===");
+    console.log("=== Bun Bucket (Native S3 CLI) ===");
     for (const warning of validation.warnings) {
       console.log(`Warning: ${warning}`);
     }
-    if (targets.length === 1) {
-      console.log(`File:      ${targets[0]!.localPath}`);
-      console.log(`Target:    s3://${auth.bucket}/${targets[0]!.objectKey}`);
+    if (isDownload) {
+      const totalDownloadBytes = downloadTargets.reduce((acc, t) => acc + (t.remoteSizeBytes ?? 0), 0);
+      if (downloadTargets.length === 1) {
+        console.log(`Source:    s3://${auth.bucket}/${downloadTargets[0]!.objectKey}`);
+        console.log(`Target:    ${downloadTargets[0]!.localPath}`);
+      } else {
+        console.log(`Source:    s3://${auth.bucket}/${options.key ?? "*"}`);
+        console.log(`Matched:   ${downloadTargets.length} object(s) (${formatBytes(totalDownloadBytes)})`);
+        console.log(`Target:    ${resolve(options.outputPath ?? ".")}`);
+      }
     } else {
-      console.log(`Inputs:    ${inputPatterns.join(", ")}`);
-      console.log(`Matched:   ${targets.length} file(s) (${formatBytes(totalBatchBytes)})`);
-      console.log(`Target:    s3://${auth.bucket}/${options.key ? `${options.key.replace(/^\/+|\/+$/g, "")}/` : ""}`);
+      const totalBatchBytes = uploadTargets.reduce((acc, t) => acc + t.sizeBytes, 0);
+      if (uploadTargets.length === 1) {
+        console.log(`File:      ${uploadTargets[0]!.localPath}`);
+        console.log(`Target:    s3://${auth.bucket}/${uploadTargets[0]!.objectKey}`);
+      } else {
+        console.log(`Inputs:    ${inputPatterns.join(", ")}`);
+        console.log(`Matched:   ${uploadTargets.length} file(s) (${formatBytes(totalBatchBytes)})`);
+        console.log(`Target:    s3://${auth.bucket}/${options.key ? `${options.key.replace(/^\/+|\/+$/g, "")}/` : ""}`);
+      }
     }
     console.log(`Endpoint:  ${targetOrigin} (region: ${auth.region})`);
     console.log(
@@ -746,9 +913,15 @@ export async function runCli(
     onTargetStart: (idx, total, target) => {
       resetProgressState();
       if (!options.json && total > 1) {
-        console.log(
-          `\n[${idx}/${total}] ${target.relativePath} -> s3://${auth.bucket}/${target.objectKey}`,
-        );
+        if (isDownload) {
+          console.log(
+            `\n[${idx}/${total}] s3://${auth.bucket}/${target.objectKey} -> ${target.localPath}`,
+          );
+        } else {
+          console.log(
+            `\n[${idx}/${total}] ${target.relativePath} -> s3://${auth.bucket}/${target.objectKey}`,
+          );
+        }
       }
     },
     onAnalysis: (analysis) => {
@@ -776,8 +949,71 @@ export async function runCli(
   };
 
   try {
-    if (targets.length === 1) {
-      const singleTarget = targets[0]!;
+    if (isDownload) {
+      if (downloadTargets.length === 1) {
+        const singleTarget = downloadTargets[0]!;
+        let report: UploadReport;
+        if (options.isolated) {
+          const controller = startIsolatedDownloadSession(
+            singleTarget,
+            options,
+            auth,
+            proxy,
+            tls,
+            envProxyOverrides,
+            callbacks,
+          );
+          const onSigInt = () => controller.cancel("Interrupted by SIGINT");
+          process.once("SIGINT", onSigInt);
+          try {
+            report = await controller.promise;
+          } finally {
+            process.removeListener("SIGINT", onSigInt);
+          }
+        } else {
+          report = await executeS3Download(singleTarget, options, auth, proxy, tls, callbacks);
+        }
+
+        if (options.json) {
+          console.log(JSON.stringify(report, null, 2));
+        } else {
+          printSingleReportSummary(report, options);
+        }
+        return report.success ? 0 : 1;
+      }
+
+      let batchReport: BatchUploadReport;
+      if (options.isolated) {
+        const controller = startIsolatedBatchDownloadSession(
+          downloadTargets,
+          options,
+          auth,
+          proxy,
+          tls,
+          envProxyOverrides,
+          callbacks,
+        );
+        const onSigInt = () => controller.cancel("Interrupted by SIGINT");
+        process.once("SIGINT", onSigInt);
+        try {
+          batchReport = await controller.promise;
+        } finally {
+          process.removeListener("SIGINT", onSigInt);
+        }
+      } else {
+        batchReport = await executeBatchDownload(downloadTargets, options, auth, proxy, tls, callbacks);
+      }
+
+      if (options.json) {
+        console.log(JSON.stringify(batchReport, null, 2));
+      } else {
+        printBatchReportSummary(batchReport);
+      }
+      return batchReport.success ? 0 : 1;
+    }
+
+    if (uploadTargets.length === 1) {
+      const singleTarget = uploadTargets[0]!;
       const singleOpts: CliOptions = {
         ...options,
         filePath: singleTarget.localPath,
@@ -817,7 +1053,7 @@ export async function runCli(
     let batchReport: BatchUploadReport;
     if (options.isolated) {
       const controller = startIsolatedBatchUploadSession(
-        targets,
+        uploadTargets,
         options,
         auth,
         proxy,
@@ -833,7 +1069,7 @@ export async function runCli(
         process.removeListener("SIGINT", onSigInt);
       }
     } else {
-      batchReport = await executeBatchUpload(targets, options, auth, proxy, tls, callbacks);
+      batchReport = await executeBatchUpload(uploadTargets, options, auth, proxy, tls, callbacks);
     }
 
     if (options.json) {
@@ -848,7 +1084,7 @@ export async function runCli(
     if (options.json) {
       console.error(JSON.stringify({ success: false, error: msg }, null, 2));
     } else {
-      console.error(`\nUpload Failed: ${msg}`);
+      console.error(`\n${isDownload ? "Download" : "Upload"} Failed: ${msg}`);
     }
     return 1;
   }

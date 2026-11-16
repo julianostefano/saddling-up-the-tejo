@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "bun-s3-uploader",
+      "name": "bun-bucket",
       "devDependencies": {
         "@types/bun": "latest",
       },

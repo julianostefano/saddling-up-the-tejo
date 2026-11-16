@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../src/cli.ts";
@@ -415,6 +415,164 @@ describe("End-to-end S3 CLI & Uploader integration", () => {
       expect(stored!.etag).toBe(`${"a".repeat(32)}-3`);
     } finally {
       mockSseKms.stop();
+    }
+  });
+
+  test("downloads a single file from S3 (s3:// auto-detect & download subcommand), verifies SHA-256 and ETag, and guards local overwrites", async () => {
+    const mock = startMockS3Server();
+    try {
+      process.env.AWS_ACCESS_KEY_ID = "test-access-key";
+      process.env.AWS_SECRET_ACCESS_KEY = "test-secret-key";
+      process.env.AWS_ENDPOINT = mock.origin;
+
+      // Upload first so bucket has real single-part & multipart objects
+      expect(await runCli([smallFilePath, "s3://dl-bucket/dumps/hello-s3.txt"])).toBe(0);
+      expect(
+        await runCli([largeFilePath, "s3://dl-bucket/dumps/large-11mb.bin", "--part-size", "5M"]),
+      ).toBe(0);
+
+      const outDir = join(workDir, "dl-single");
+      mkdirSync(outDir, { recursive: true });
+
+      // 1. Auto-detected download via s3:// source URL into output dir
+      const dlSingleCode = await runCli(["s3://dl-bucket/dumps/hello-s3.txt", outDir]);
+      expect(dlSingleCode).toBe(0);
+      const downloadedSmall = join(outDir, "hello-s3.txt");
+      expect(existsSync(downloadedSmall)).toBe(true);
+      expect(await Bun.file(downloadedSmall).text()).toBe(
+        "Native Bun S3 integration test payload with SHA-256 verification.",
+      );
+
+      // 2. Local overwrite protection: non-TTY must refuse without --yes / --skip-existing
+      await Bun.write(downloadedSmall, "LOCAL_MODIFIED");
+      const refusedCode = await runCli(["s3://dl-bucket/dumps/hello-s3.txt", downloadedSmall]);
+      expect(refusedCode).toBe(1);
+      expect(await Bun.file(downloadedSmall).text()).toBe("LOCAL_MODIFIED");
+
+      // 3. --skip-existing skips cleanly without overwriting
+      const skippedCode = await runCli([
+        "download",
+        "dl-bucket/dumps/hello-s3.txt",
+        downloadedSmall,
+        "--skip-existing",
+      ]);
+      expect(skippedCode).toBe(0);
+      expect(await Bun.file(downloadedSmall).text()).toBe("LOCAL_MODIFIED");
+
+      // 4. Interactive confirmOverwrite overrides cleanly + --yes / JSON report check
+      const interactiveCode = await runCli(["download", "dl-bucket/dumps/hello-s3.txt", downloadedSmall], {
+        confirmOverwrite: async (info) => {
+          expect(info.direction).toBe("download");
+          return "overwrite";
+        },
+      });
+      expect(interactiveCode).toBe(0);
+      expect(await Bun.file(downloadedSmall).text()).toBe(
+        "Native Bun S3 integration test payload with SHA-256 verification.",
+      );
+
+      // 5. Large multipart object download via --isolated + --yes
+      const largeOut = join(outDir, "large-11mb.bin");
+      const largeDlCode = await runCli([
+        "download",
+        "dl-bucket/dumps/large-11mb.bin",
+        largeOut,
+        "--isolated",
+        "--yes",
+      ]);
+      expect(largeDlCode).toBe(0);
+      expect(Bun.file(largeOut).size).toBe(11 * 1024 * 1024);
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("downloads wildcard patterns and key prefixes via S3Client.list() and Bun.Glob", async () => {
+    const mock = startMockS3Server();
+    try {
+      process.env.AWS_ACCESS_KEY_ID = "test-access-key";
+      process.env.AWS_SECRET_ACCESS_KEY = "test-secret-key";
+      process.env.AWS_ENDPOINT = mock.origin;
+
+      // Seed bucket objects
+      const seed = async (bucket: string, key: string, body: string) => {
+        const data = new TextEncoder().encode(body);
+        const etag = new Bun.CryptoHasher("md5").update(data).digest("hex");
+        mock.objects.set(`${bucket}/${key}`, {
+          bucket,
+          key,
+          data,
+          etag,
+          contentType: "application/octet-stream",
+          lastModified: new Date(),
+        });
+      };
+
+      await seed("wild-bucket", "dumps/20261116/CLBP_01.DMP", "DUMP_01");
+      await seed("wild-bucket", "dumps/20261116/CLBP_02.DMP", "DUMP_02");
+      await seed("wild-bucket", "dumps/20261116/empty.dmp", "");
+      await seed("wild-bucket", "dumps/20261116/notes.log", "IGNORE_LOG");
+      await seed("wild-bucket", "dumps/20261116/sub/nested.js", "console.log('sub');");
+      await seed("wild-bucket", "dumps/20261116/root.js", "console.log('root');");
+
+      const wildOutDir = join(workDir, "dl-wild");
+      const wildCode = await runCli([
+        "s3://wild-bucket/dumps/20261116/*.DMP",
+        wildOutDir,
+        "--verify",
+        "full",
+      ]);
+      expect(wildCode).toBe(0);
+      expect(mock.stats.listRequests).toBeGreaterThan(0);
+      expect(await Bun.file(join(wildOutDir, "CLBP_01.DMP")).text()).toBe("DUMP_01");
+      expect(await Bun.file(join(wildOutDir, "CLBP_02.DMP")).text()).toBe("DUMP_02");
+      expect(existsSync(join(wildOutDir, "notes.log"))).toBe(false);
+
+      // Zero-byte download & JSON report verification
+      const emptyOut = join(workDir, "dl-empty.dmp");
+      const jsonDlProc = Bun.spawn(
+        ["bun", "run", "src/index.ts", "download", "wild-bucket/dumps/20261116/empty.dmp", emptyOut, "--json"],
+        {
+          cwd: join(import.meta.dir, ".."),
+          env: { ...process.env },
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+      expect(await jsonDlProc.exited).toBe(0);
+      const dlReport = JSON.parse(await new Response(jsonDlProc.stdout).text()) as {
+        operation: string;
+        success: boolean;
+        localPath: string;
+        verification: { sha256Match: boolean };
+      };
+      expect(dlReport.operation).toBe("download");
+      expect(dlReport.success).toBe(true);
+      expect(dlReport.localPath).toBe(emptyOut);
+      expect(dlReport.verification.sha256Match).toBe(true);
+      expect(Bun.file(emptyOut).size).toBe(0);
+
+      // Recursive wildcard without s3:// scheme via `download` subcommand
+      const jsOutDir = join(workDir, "dl-js");
+      const jsCode = await runCli([
+        "download",
+        "wild-bucket/dumps/20261116/**/*.js",
+        jsOutDir,
+      ]);
+      expect(jsCode).toBe(0);
+      expect(await Bun.file(join(jsOutDir, "root.js")).text()).toBe("console.log('root');");
+      expect(await Bun.file(join(jsOutDir, "sub", "nested.js")).text()).toBe("console.log('sub');");
+      expect(existsSync(join(jsOutDir, "CLBP_01.DMP"))).toBe(false);
+
+      // Prefix fallback download (folder path without trailing `/` or `*`)
+      const prefixOutDir = join(workDir, "dl-prefix");
+      const prefixCode = await runCli(["download", "wild-bucket/dumps/20261116", prefixOutDir]);
+      expect(prefixCode).toBe(0);
+      expect(await Bun.file(join(prefixOutDir, "notes.log")).text()).toBe("IGNORE_LOG");
+      expect(await Bun.file(join(prefixOutDir, "CLBP_01.DMP")).text()).toBe("DUMP_01");
+      expect(await Bun.file(join(prefixOutDir, "empty.dmp")).text()).toBe("");
+    } finally {
+      mock.stop();
     }
   });
 });

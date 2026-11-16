@@ -18,6 +18,7 @@ export interface MockS3Stats {
   multipartCompletions: number;
   headRequests: number;
   getRequests: number;
+  listRequests: number;
 }
 
 interface ActiveMultipart {
@@ -105,6 +106,15 @@ export function generateSelfSignedCert(): { keyPem: string; certPem: string } {
   return { keyPem, certPem };
 }
 
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 /**
  * Starts an in-process S3-compatible mock server (HTTP or self-signed HTTPS) using `Bun.serve`.
  */
@@ -123,6 +133,7 @@ export function startMockS3Server(
     multipartCompletions: 0,
     headRequests: 0,
     getRequests: 0,
+    listRequests: 0,
   };
 
   const server = Bun.serve({
@@ -246,6 +257,55 @@ export function startMockS3Server(
       }
 
       if (req.method === "GET") {
+        if (key === "") {
+          stats.listRequests++;
+          const prefix = url.searchParams.get("prefix") ?? "";
+          const continuationToken = url.searchParams.get("continuation-token") ?? "";
+          const startAfter = url.searchParams.get("start-after") ?? "";
+          const maxKeysRaw = Number(url.searchParams.get("max-keys") ?? "1000");
+          const maxKeys = Number.isFinite(maxKeysRaw) && maxKeysRaw > 0 ? Math.floor(maxKeysRaw) : 1000;
+          const cursor = continuationToken || startAfter;
+
+          const matched = Array.from(objects.values())
+            .filter((o) => o.bucket === bucket && o.key.startsWith(prefix))
+            .sort((a, b) => a.key.localeCompare(b.key))
+            .filter((o) => !cursor || o.key > cursor);
+
+          const slice = matched.slice(0, maxKeys);
+          const isTruncated = matched.length > maxKeys;
+          const nextToken = isTruncated && slice.length > 0 ? slice[slice.length - 1]!.key : "";
+
+          const contentsXml = slice
+            .map(
+              (o) =>
+                `<Contents>` +
+                `<Key>${escapeXml(o.key)}</Key>` +
+                `<LastModified>${o.lastModified.toISOString()}</LastModified>` +
+                `<ETag>"${escapeXml(o.etag)}"</ETag>` +
+                `<Size>${o.data.byteLength}</Size>` +
+                `<StorageClass>STANDARD</StorageClass>` +
+                `</Contents>`,
+            )
+            .join("");
+
+          const xml =
+            `<?xml version="1.0" encoding="UTF-8"?>` +
+            `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` +
+            `<Name>${escapeXml(bucket)}</Name>` +
+            `<Prefix>${escapeXml(prefix)}</Prefix>` +
+            `<KeyCount>${slice.length}</KeyCount>` +
+            `<MaxKeys>${maxKeys}</MaxKeys>` +
+            `<IsTruncated>${isTruncated ? "true" : "false"}</IsTruncated>` +
+            (nextToken ? `<NextContinuationToken>${escapeXml(nextToken)}</NextContinuationToken>` : "") +
+            contentsXml +
+            `</ListBucketResult>`;
+
+          return new Response(xml, {
+            status: 200,
+            headers: { "content-type": "application/xml" },
+          });
+        }
+
         stats.getRequests++;
         const obj = objects.get(objectMapKey);
         if (!obj) {

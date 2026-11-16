@@ -3,6 +3,7 @@ import type {
   BatchUploadReport,
   CliOptions,
   ProxyConfig,
+  ResolvedDownloadTarget,
   ResolvedUploadTarget,
   S3AuthConfig,
   TlsConfig,
@@ -15,27 +16,45 @@ export interface IsolatedSessionController<T = UploadReport> {
   cancel: (reason?: string) => void;
 }
 
+interface IsolatedEntryExports {
+  runInGraph: (
+    o: CliOptions,
+    a: S3AuthConfig,
+    p: ProxyConfig,
+    t: TlsConfig,
+    c: UploadCallbacks,
+  ) => Promise<UploadReport>;
+  runBatchInGraph: (
+    targets: ResolvedUploadTarget[],
+    o: CliOptions,
+    a: S3AuthConfig,
+    p: ProxyConfig,
+    t: TlsConfig,
+    c: UploadCallbacks,
+  ) => Promise<BatchUploadReport>;
+  runDownloadInGraph: (
+    target: ResolvedDownloadTarget,
+    o: CliOptions,
+    a: S3AuthConfig,
+    p: ProxyConfig,
+    t: TlsConfig,
+    c: UploadCallbacks,
+  ) => Promise<UploadReport>;
+  runBatchDownloadInGraph: (
+    targets: ResolvedDownloadTarget[],
+    o: CliOptions,
+    a: S3AuthConfig,
+    p: ProxyConfig,
+    t: TlsConfig,
+    c: UploadCallbacks,
+  ) => Promise<BatchUploadReport>;
+}
+
 function startGraphSession<T>(
   tls: TlsConfig,
   envOverrides: Record<string, string | undefined>,
   callbacks: UploadCallbacks,
-  invoker: (mod: {
-    runInGraph: (
-      o: CliOptions,
-      a: S3AuthConfig,
-      p: ProxyConfig,
-      t: TlsConfig,
-      c: UploadCallbacks,
-    ) => Promise<UploadReport>;
-    runBatchInGraph: (
-      targets: ResolvedUploadTarget[],
-      o: CliOptions,
-      a: S3AuthConfig,
-      p: ProxyConfig,
-      t: TlsConfig,
-      c: UploadCallbacks,
-    ) => Promise<BatchUploadReport>;
-  }) => Promise<T>,
+  invoker: (mod: IsolatedEntryExports) => Promise<T>,
 ): IsolatedSessionController<T> {
   const isolatedEnv: Record<string, string | undefined> = {
     ...process.env,
@@ -82,7 +101,7 @@ function startGraphSession<T>(
 
   const promise = Promise.race([runPromise, cancelled.promise]);
 
-  const cancel = (reason = "Upload session cancelled by user.") => {
+  const cancel = (reason = "Transfer session cancelled by user.") => {
     if (!isDisposed) {
       isDisposed = true;
       graph.dispose();
@@ -123,5 +142,39 @@ export function startIsolatedBatchUploadSession(
 ): IsolatedSessionController<BatchUploadReport> {
   return startGraphSession(tls, envOverrides, callbacks, (mod) =>
     mod.runBatchInGraph(targets, options, auth, proxy, tls, callbacks),
+  );
+}
+
+/**
+ * Executes a single-file download session inside an isolated `Bun.ModuleGraph`.
+ */
+export function startIsolatedDownloadSession(
+  target: ResolvedDownloadTarget,
+  options: CliOptions,
+  auth: S3AuthConfig,
+  proxy: ProxyConfig,
+  tls: TlsConfig,
+  envOverrides: Record<string, string | undefined>,
+  callbacks: UploadCallbacks = {},
+): IsolatedSessionController<UploadReport> {
+  return startGraphSession(tls, envOverrides, callbacks, (mod) =>
+    mod.runDownloadInGraph(target, options, auth, proxy, tls, callbacks),
+  );
+}
+
+/**
+ * Executes a multi-file batch download session inside an isolated `Bun.ModuleGraph`.
+ */
+export function startIsolatedBatchDownloadSession(
+  targets: ResolvedDownloadTarget[],
+  options: CliOptions,
+  auth: S3AuthConfig,
+  proxy: ProxyConfig,
+  tls: TlsConfig,
+  envOverrides: Record<string, string | undefined>,
+  callbacks: UploadCallbacks = {},
+): IsolatedSessionController<BatchUploadReport> {
+  return startGraphSession(tls, envOverrides, callbacks, (mod) =>
+    mod.runBatchDownloadInGraph(targets, options, auth, proxy, tls, callbacks),
   );
 }

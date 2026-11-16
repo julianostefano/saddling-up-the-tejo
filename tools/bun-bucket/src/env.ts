@@ -83,7 +83,7 @@ export function validateAndResolveAuth(
       field: "bucket",
       envVars: ["S3_BUCKET", "AWS_BUCKET"],
       cliFlag: "--bucket <name> or positional <bucket>",
-      description: "Destination S3 bucket name is required.",
+      description: "Target S3 bucket name is required.",
     });
   }
 

@@ -1,14 +1,17 @@
 /**
- * Core domain types for the native Bun S3 Uploader CLI and TUI.
+ * Core domain types for the Bun Bucket CLI and TUI (native S3 uploader & downloader).
  */
 
 export type VerifyMode = "full" | "stat" | "none";
+
+export type TransferOperation = "upload" | "download";
 
 export type OverwritePolicy = "ask" | "overwrite" | "skip";
 
 export type OverwriteDecision = "overwrite" | "skip" | "overwrite-all" | "skip-all" | "abort";
 
 export interface OverwritePromptInfo {
+  direction?: TransferOperation;
   bucket: string;
   key: string;
   localPath: string;
@@ -25,10 +28,20 @@ export interface ResolvedUploadTarget {
   sizeBytes: number;
 }
 
+export interface ResolvedDownloadTarget {
+  objectKey: string;
+  relativePath: string;
+  localPath: string;
+  remoteSizeBytes?: number;
+  remoteEtag?: string;
+  remoteLastModified?: Date;
+}
+
 export type TransferPhase =
   | "analyzing"
   | "hashing"
   | "uploading"
+  | "downloading"
   | "verifying"
   | "completed"
   | "failed";
@@ -96,8 +109,10 @@ export interface TlsConfig {
 }
 
 export interface CliOptions {
+  operation?: TransferOperation;
   filePath?: string;
   filePaths?: string[];
+  outputPath?: string;
   bucket?: string;
   key?: string;
   endpoint?: string;
@@ -179,11 +194,13 @@ export interface VerificationResult {
 }
 
 export interface UploadReport {
+  operation?: TransferOperation;
   success: boolean;
   skipped?: boolean;
   skipReason?: string;
   bucket: string;
   key: string;
+  localPath?: string;
   endpoint: string;
   region: string;
   fileAnalysis: FileAnalysis;
@@ -204,7 +221,10 @@ export interface UploadReport {
   error?: string;
 }
 
+export type TransferReport = UploadReport;
+
 export interface BatchUploadReport {
+  operation?: TransferOperation;
   success: boolean;
   bucket: string;
   endpoint: string;
@@ -221,11 +241,17 @@ export interface BatchUploadReport {
   results: UploadReport[];
 }
 
+export type BatchTransferReport = BatchUploadReport;
+
 export interface UploadCallbacks {
   onAnalysis?: (analysis: FileAnalysis) => void;
   onProgress?: (snapshot: ProgressSnapshot) => void;
   onLog?: (level: "info" | "warn" | "error" | "success", message: string) => void;
-  onTargetStart?: (index: number, total: number, target: ResolvedUploadTarget) => void;
+  onTargetStart?: (
+    index: number,
+    total: number,
+    target: ResolvedUploadTarget | ResolvedDownloadTarget,
+  ) => void;
   confirmOverwrite?: (info: OverwritePromptInfo) => Promise<OverwriteDecision>;
 }
 

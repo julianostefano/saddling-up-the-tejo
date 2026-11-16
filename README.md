@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Oracle Cloud Infrastructure](https://img.shields.io/badge/OCI-Terraform-F80000?logo=oracle&logoColor=white)](./oci/terraform/autonomous-db-23ai/)
 [![Snowflake & Python](https://img.shields.io/badge/Analytics-Snowflake%20%7C%20Python-29B5E8?logo=snowflake&logoColor=white)](./Notebooks/)
-[![Bun Native Tooling](https://img.shields.io/badge/Tooling-Bun%20%7C%20TypeScript-FBF0DF?logo=bun&logoColor=black)](./tools/bun-s3-uploader/)
+[![Bun Native Tooling](https://img.shields.io/badge/Tooling-Bun%20%7C%20TypeScript-FBF0DF?logo=bun&logoColor=black)](./tools/bun-bucket/)
 
 **Multicloud Database Architecture, Infrastructure as Code (IaC), Quantitative Analytics, and Operations Tooling Portfolio** — Enterprise-grade implementations spanning Oracle Cloud Infrastructure (OCI), Oracle Autonomous Database 23ai/26ai, Snowflake Cloud Data Platform, Python quantitative modeling, and native Bun/TypeScript CLI tooling.
 
@@ -19,7 +19,7 @@
 
 1. **Data Analytics, Quantitative Finance & SQL Engineering** — Snowflake SQL analytical workflows with Plotly visualizations and Markowitz Mean-Variance portfolio optimization in Python.
 2. **Cloud Infrastructure as Code (OCI & Terraform)** — Modular Terraform stacks for Virtual Cloud Networks (VCNs), Always Free & production Oracle Autonomous Database 23ai/26ai deployments with AI Vector Search, cloud-init compute provisioning, and OCI Resource Manager integration.
-3. **Cloud & Database Operations Tooling** — Purpose-built operational utilities including a zero-dependency native Bun S3 uploader (`CLI` + `TUI`) and an Oracle Data Pump (`expdp`) log-to-CSV parser.
+3. **Cloud & Database Operations Tooling** — Purpose-built operational utilities including `bun-bucket` (a zero-dependency native Bun S3 uploader & downloader `CLI` + `TUI`) and an Oracle Data Pump (`expdp`) log-to-CSV parser.
 
 ---
 
@@ -36,8 +36,8 @@ saddling-up-the-tejo/
 │       └── network-infrastructure/         # OCI VCN, subnets, gateways, route tables & security controls
 ├── tools/
 │   ├── README.md                           # Operations tooling index & end-to-end DBA workflow
-│   ├── bun-s3-uploader/                    # Native Bun S3 Uploader CLI/TUI (multipart, SHA-256, proxy, TLS)
-│   │   ├── src/                            # CLI, TUI, S3 uploader, Worker hasher, Shell & ModuleGraph
+│   ├── bun-bucket/                         # Native Bun S3 Uploader & Downloader CLI/TUI
+│   │   ├── src/                            # CLI, TUI, S3 uploader/downloader, Worker hasher, Shell & ModuleGraph
 │   │   └── tests/                          # Unit & integration tests (mock S3, self-signed TLS, proxy)
 │   └── datapump-log-parser/                # Oracle Data Pump (expdp) log parser to structured CSV
 ├── LICENSE                                 # MIT License
@@ -109,18 +109,19 @@ Reusable Terraform networking foundation provisioning:
 
 **Overview & CLI Reference:** [`tools/README.md`](./tools/README.md)
 
-#### A. Bun Native S3 Uploader (`CLI` & `TUI`)
-**Location:** [`tools/bun-s3-uploader/`](./tools/bun-s3-uploader/) · [Tool README](./tools/bun-s3-uploader/README.md)
+#### A. Bun Bucket — Native S3 Uploader & Downloader (`CLI` & `TUI`)
+**Location:** [`tools/bun-bucket/`](./tools/bun-bucket/) · [Tool README](./tools/bun-bucket/README.md)
 
-High-performance, zero-runtime-dependency S3 transfer utility engineered exclusively with **Bun's native APIs** (`Bun.S3Client`, `Bun.$`, `Bun.Glob`, `Worker`, `Bun.CryptoHasher`, `Bun.ModuleGraph`):
-- **Single-Part & Concurrent Multipart Transfers:** Analyzes file size against `--multipart-threshold` (default `5 MiB`) and selects Single-Part `PutObject` or concurrent S3 Multipart Upload (`S3File.writer()`) with configurable `--part-size`, `--queue-size`, and `--retry`.
-- **Integrity & Telemetry:** Offloads `SHA-256`, `MD5`, and multipart `ETag` hashing to a `Worker` thread; renders live progress bars, ETA, upload/readback speeds, and bandwidth utilization (`Mbps` / `%`). Handles AWS S3 **SSE-KMS** multipart ETags seamlessly alongside full streaming `SHA-256` verification (`--verify full`).
-- **Batching, Normalization & Overwrite Protection:** Accepts `s3://bucket/prefix/`, bare `bucket/prefix/`, or `<bucket> <key>` targets; appends local filenames automatically to folder targets; expands wildcards (`Bun.Glob` and bash-expanded multi-file args) and recursive directories; and enforces overwrite confirmation (`[y]es / [N]o / [a]ll / [s]kip all / [q]uit`, plus `--yes` and `--skip-existing`).
-- **Enterprise Networking & Standalone Compilation:** Supports `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`, invalid/self-signed TLS certificates (`-k` / `--insecure` / `NODE_TLS_REJECT_UNAUTHORIZED=0`), isolated `Bun.ModuleGraph` execution (`--isolated`), interactive TTY TUI (`--tui`), and Linux x64 cross-compilation (`bun run build:linux-x64`).
+High-performance, zero-runtime-dependency S3 upload and download utility engineered exclusively with **Bun's native APIs** (`Bun.S3Client`, `Bun.$`, `Bun.Glob`, `Worker`, `Bun.CryptoHasher`, `Bun.ModuleGraph`):
+- **Single-Part & Concurrent Multipart Uploads:** Analyzes file size against `--multipart-threshold` (default `5 MiB`) and selects Single-Part `PutObject` or concurrent S3 Multipart Upload (`S3File.writer()`) with configurable `--part-size`, `--queue-size`, and `--retry`.
+- **Single-Object & Wildcard S3 Downloads:** Supports downloading individual objects (`s3://bucket/key`) as well as wildcard/prefix matches (`"s3://bucket/dumps/*.DMP"`, `download bucket/site/**/*.js`) via `S3Client.prototype.list()` + `Bun.Glob`, with local overwrite protection.
+- **Integrity & Telemetry:** Offloads `SHA-256`, `MD5`, and multipart `ETag` hashing to a `Worker` thread; renders live progress bars, ETA, upload/download speeds, and bandwidth utilization (`Mbps` / `%`). Handles AWS S3 **SSE-KMS** multipart ETags seamlessly alongside full streaming `SHA-256` verification (`--verify full`).
+- **Batching, Normalization & Overwrite Protection:** Accepts `s3://bucket/prefix/`, bare `bucket/prefix/`, or `<bucket> <key>` targets; appends local filenames automatically when uploading to folder targets; expands wildcards (`Bun.Glob` and bash-expanded multi-file args) and recursive directories; and enforces overwrite confirmation (`[y]es / [N]o / [a]ll / [s]kip all / [q]uit`, plus `--yes` and `--skip-existing`).
+- **Enterprise Networking & Standalone Compilation:** Supports `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`, invalid/self-signed TLS certificates (`-k` / `--insecure` / `NODE_TLS_REJECT_UNAUTHORIZED=0`), isolated `Bun.ModuleGraph` execution (`--isolated`), interactive TTY TUI (`--tui`), and Linux x64 cross-compilation (`bun run build:linux-x64` -> `./dist/bun-bucket-linux-x64`).
 
 **Quick Start:**
 ```bash
-cd tools/bun-s3-uploader
+cd tools/bun-bucket
 bun install
 AGENT=1 bun check --no-script
 bun test --check
@@ -128,6 +129,9 @@ bun test --check
 # Upload a file or wildcard batch (with or without explicit s3:// prefix)
 bun run src/index.ts ./backup.dmp my-bucket/dumps/20261116/ --insecure
 bun run src/index.ts "./dumps/*.DMP" s3://my-bucket/dumps/20261116/ --skip-existing
+
+# Download a single file or wildcard batch from S3 (auto-detected via s3:// prefix)
+bun run src/index.ts "s3://my-bucket/dumps/20261116/*.DMP" ./restore/ --skip-existing
 ```
 
 #### B. Oracle Data Pump (`expdp`) Log Parser
@@ -147,8 +151,8 @@ python parse_expdp_log.py export_prod.log -o exported_tables.csv
 python tools/datapump-log-parser/parse_expdp_log.py /storage/dumps/clbp_export.log -o /storage/dumps/clbp_export.csv
 
 # 2. Upload all dump files and CSV report to S3 with multipart transfer & SHA-256 verification
-./bun-s3-upload-linux-x64 /storage/dumps/CLBP_CRT_* s3://db-backups-bucket/dumps/20261116/ --skip-existing
-./bun-s3-upload-linux-x64 /storage/dumps/clbp_export.csv s3://db-backups-bucket/dumps/20261116/ --yes
+./bun-bucket-linux-x64 /storage/dumps/CLBP_CRT_* s3://db-backups-bucket/dumps/20261116/ --skip-existing
+./bun-bucket-linux-x64 /storage/dumps/clbp_export.csv s3://db-backups-bucket/dumps/20261116/ --yes
 ```
 
 ---
@@ -161,7 +165,7 @@ python tools/datapump-log-parser/parse_expdp_log.py /storage/dumps/clbp_export.l
 | FAANG Risk Analysis | Quantitative Finance | Python, PyPortfolioOpt, NumPy, Matplotlib | [`Notebooks/Risk_Analysis/`](./Notebooks/Risk_Analysis/) |
 | Autonomous DB 23ai/26ai | Cloud IaC & Vector DB | Terraform, OCI, Oracle Linux, Bash | [`oci/terraform/autonomous-db-23ai/`](./oci/terraform/autonomous-db-23ai/) |
 | Network Infrastructure | Cloud Networking IaC | Terraform, OCI VCN/NSG | [`oci/terraform/network-infrastructure/`](./oci/terraform/network-infrastructure/) |
-| Bun Native S3 Uploader | Cloud Storage CLI & TUI | Bun, TypeScript, S3Client, Workers | [`tools/bun-s3-uploader/`](./tools/bun-s3-uploader/) |
+| Bun Bucket (`bun-bucket`) | Cloud Storage CLI & TUI | Bun, TypeScript, S3Client, Workers | [`tools/bun-bucket/`](./tools/bun-bucket/) |
 | Data Pump Log Parser | Database Operations | Python 3 Standard Library | [`tools/datapump-log-parser/`](./tools/datapump-log-parser/) |
 
 ---

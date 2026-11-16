@@ -24,6 +24,11 @@ import {
   validateAndResolveAuth,
 } from "./env.ts";
 import {
+  executeBatchDownload,
+  executeS3Download,
+  resolveDownloadTargets,
+} from "./downloader.ts";
+import {
   listDirectoryEntriesWithShell,
   resolveUploadTargets,
   type DirectoryEntry,
@@ -37,7 +42,9 @@ import type {
   OverwritePolicy,
   OverwritePromptInfo,
   ProgressSnapshot,
+  ResolvedDownloadTarget,
   ResolvedUploadTarget,
+  TransferOperation,
   UploadCallbacks,
   UploadReport,
   VerifyMode,
@@ -65,7 +72,9 @@ interface TuiState {
   editingText: boolean;
   editBuffer: string;
 
+  operation: TransferOperation;
   filePath: string;
+  outputPath: string;
   bucket: string;
   key: string;
   endpoint: string;
@@ -83,7 +92,7 @@ interface TuiState {
 
   batchIndex?: number;
   batchTotal?: number;
-  currentTarget?: ResolvedUploadTarget;
+  currentTarget?: ResolvedUploadTarget | ResolvedDownloadTarget;
   analysis?: FileAnalysis;
   phaseSnapshots: Partial<Record<ProgressSnapshot["phase"], ProgressSnapshot>>;
   logs: Array<{ level: string; text: string }>;
@@ -113,14 +122,27 @@ function renderScreen(state: TuiState): void {
   };
 
   out.push(`┌${line}┐`);
-  boxLine(`${ANSI.bold}${ANSI.cyan}BUN NATIVE S3 UPLOADER (TUI)${ANSI.reset}`);
+  boxLine(`${ANSI.bold}${ANSI.cyan}BUN BUCKET - NATIVE S3 CLI & TUI${ANSI.reset}`);
   out.push(`├${line}┤`);
 
   if (state.screen === "config") {
+    const isDownload = state.operation === "download";
     const fields: Array<{ label: string; value: string }> = [
-      { label: "Path / Dir / Glob", value: state.filePath || "(empty - press B to browse or enter *.glob / dir)" },
-      { label: "Destination Bucket", value: state.bucket || "(uses S3_BUCKET/AWS_BUCKET)" },
-      { label: "Key / Prefix", value: state.key || "(auto: filename or relative path)" },
+      {
+        label: "Operation Mode",
+        value: isDownload ? "[DOWNLOAD] S3 -> Local" : "[UPLOAD]   Local -> S3",
+      },
+      isDownload
+        ? { label: "Local Output Dir", value: state.outputPath || "." }
+        : { label: "Local Path / Glob", value: state.filePath || "(empty - press B to browse or enter *.glob / dir)" },
+      {
+        label: isDownload ? "Source Bucket" : "Destination Bucket",
+        value: state.bucket || "(uses S3_BUCKET/AWS_BUCKET)",
+      },
+      {
+        label: isDownload ? "Remote Key / Glob" : "Key / Prefix",
+        value: state.key || (isDownload ? "(e.g. dumps/*.DMP or path/to/file)" : "(auto: filename or relative path)"),
+      },
       { label: "Endpoint URL", value: state.endpoint || "(uses env or AWS default)" },
       { label: "AWS Region", value: state.region || "us-east-1" },
       { label: "Multipart Size", value: `${state.partSizeMiB} MiB` },
@@ -192,11 +214,12 @@ function renderScreen(state: TuiState): void {
     state.screen === "confirm-overwrite" ||
     state.screen === "summary"
   ) {
+    const isDownload = state.operation === "download";
     const batchTag =
       state.batchTotal && state.batchTotal > 1 && state.batchIndex !== undefined
         ? ` [File ${state.batchIndex}/${state.batchTotal}]`
         : "";
-    boxLine(`${ANSI.bold}Transfer Dashboard${batchTag}${ANSI.reset}`);
+    boxLine(`${ANSI.bold}Transfer Dashboard (${isDownload ? "DOWNLOAD" : "UPLOAD"})${batchTag}${ANSI.reset}`);
     if (state.currentTarget) {
       boxLine(`Key: ${state.currentTarget.objectKey}`);
     }
@@ -206,11 +229,16 @@ function renderScreen(state: TuiState): void {
     }
     out.push(`├${line}┤`);
 
-    const orderedPhases: Array<{ key: ProgressSnapshot["phase"]; title: string }> = [
-      { key: "hashing", title: "1. Local SHA-256" },
-      { key: "uploading", title: "2. S3 Upload    " },
-      { key: "verifying", title: "3. Verify/Read  " },
-    ];
+    const orderedPhases: Array<{ key: ProgressSnapshot["phase"]; title: string }> = isDownload
+      ? [
+          { key: "downloading", title: "1. S3 Download  " },
+          { key: "verifying", title: "2. Verify SHA256" },
+        ]
+      : [
+          { key: "hashing", title: "1. Local SHA-256" },
+          { key: "uploading", title: "2. S3 Upload    " },
+          { key: "verifying", title: "3. Verify/Read  " },
+        ];
 
     for (const p of orderedPhases) {
       const snap = state.phaseSnapshots[p.key];
@@ -233,7 +261,12 @@ function renderScreen(state: TuiState): void {
       const ov = state.pendingOverwrite;
       out.push(`├${line}┤`);
       out.push(`│ ${ANSI.yellow}${ANSI.bold}OVERWRITE CONFIRMATION REQUIRED${ANSI.reset}`);
-      boxLine(`Target Object: s3://${ov.bucket}/${ov.key}`);
+      if (ov.direction === "download") {
+        boxLine(`Local File:    ${ov.localPath}`);
+        boxLine(`Remote Object: s3://${ov.bucket}/${ov.key}`);
+      } else {
+        boxLine(`Target Object: s3://${ov.bucket}/${ov.key}`);
+      }
       boxLine(
         `Local Size: ${formatBytes(ov.localSizeBytes)} | Remote Size: ${ov.remoteSizeBytes !== undefined ? formatBytes(ov.remoteSizeBytes) : "unknown"}${ov.remoteEtag ? ` | ETag: ${ov.remoteEtag}` : ""}`,
       );
@@ -260,23 +293,29 @@ function renderScreen(state: TuiState): void {
       out.push(`├${line}┤`);
       if (state.batchReport) {
         const b = state.batchReport;
+        const bDownload = b.operation === "download";
         const headingColor = b.success ? ANSI.green : ANSI.red;
-        out.push(`│ ${headingColor}${ANSI.bold}BATCH TRANSFER ${b.success ? "COMPLETED" : "FINISHED WITH ERRORS"}${ANSI.reset}`);
+        out.push(`│ ${headingColor}${ANSI.bold}BATCH ${bDownload ? "DOWNLOAD" : "UPLOAD"} ${b.success ? "COMPLETED" : "FINISHED WITH ERRORS"}${ANSI.reset}`);
         boxLine(`Bucket:        s3://${b.bucket}`);
-        boxLine(`Files:         ${b.totalFiles} total | ${b.uploadedCount} uploaded | ${b.skippedCount} skipped | ${b.failedCount} failed`);
+        boxLine(`Files:         ${b.totalFiles} total | ${b.uploadedCount} ${bDownload ? "downloaded" : "uploaded"} | ${b.skippedCount} skipped | ${b.failedCount} failed`);
         boxLine(`Total Volume:  ${formatBytes(b.uploadedBytes)} / ${formatBytes(b.totalBytes)} in ${formatDurationMs(b.durationMs)}`);
         boxLine(`Avg Speed/BW:  ${formatSpeed(b.avgSpeedBytesPerSec)} | ${formatBandwidth(b.avgBandwidthMbps)}`);
       } else if (state.report?.skipped) {
         const r = state.report;
-        out.push(`│ ${ANSI.yellow}${ANSI.bold}UPLOAD SKIPPED${ANSI.reset}`);
-        boxLine(`Target:  s3://${r.bucket}/${r.key}`);
+        const rDownload = r.operation === "download";
+        out.push(`│ ${ANSI.yellow}${ANSI.bold}${rDownload ? "DOWNLOAD" : "UPLOAD"} SKIPPED${ANSI.reset}`);
+        boxLine(`Target:  ${rDownload && r.localPath ? r.localPath : `s3://${r.bucket}/${r.key}`}`);
         boxLine(`Reason:  ${r.skipReason ?? "Skipped"}`);
       } else if (state.report?.success) {
         const r = state.report;
-        out.push(`│ ${ANSI.green}${ANSI.bold}UPLOAD & VERIFICATION SUCCEEDED${ANSI.reset}`);
-        boxLine(`Target:          s3://${r.bucket}/${r.key}`);
+        const rDownload = r.operation === "download";
+        out.push(`│ ${ANSI.green}${ANSI.bold}${rDownload ? "DOWNLOAD" : "UPLOAD"} & VERIFICATION SUCCEEDED${ANSI.reset}`);
+        boxLine(`Source/Target:   s3://${r.bucket}/${r.key}`);
+        if (rDownload && r.localPath) {
+          boxLine(`Local File:      ${r.localPath}`);
+        }
         boxLine(`Strategy:        ${r.upload.strategy.toUpperCase()} (${r.upload.partsUploaded} part(s)) in ${formatDurationMs(r.upload.durationMs)}`);
-        boxLine(`Upload Speed:    avg ${formatSpeed(r.upload.avgSpeedBytesPerSec)} | peak ${formatSpeed(r.upload.peakSpeedBytesPerSec)}`);
+        boxLine(`${rDownload ? "Download" : "Upload"} Speed:  avg ${formatSpeed(r.upload.avgSpeedBytesPerSec)} | peak ${formatSpeed(r.upload.peakSpeedBytesPerSec)}`);
         boxLine(`Bandwidth Used:  ${formatBandwidth(r.upload.avgBandwidthMbps)} (${r.upload.bandwidthUtilizationPct.toFixed(1)}% link)`);
         if (r.verification.downloadSpeedBytesPerSec !== undefined) {
           boxLine(`Download Speed:  ${formatSpeed(r.verification.downloadSpeedBytesPerSec)} (${formatBandwidth(r.verification.downloadBandwidthMbps ?? 0)})`);
@@ -287,7 +326,7 @@ function renderScreen(state: TuiState): void {
         }
         boxLine(`TLS Mode:        ${r.tls.allowInvalidCerts ? "Allow Invalid Certs" : "Strict"}`);
       } else {
-        out.push(`│ ${ANSI.red}${ANSI.bold}UPLOAD FAILED${ANSI.reset}`);
+        out.push(`│ ${ANSI.red}${ANSI.bold}${isDownload ? "DOWNLOAD" : "UPLOAD"} FAILED${ANSI.reset}`);
         for (const errLine of (state.errorText ?? "Unknown error").split("\n")) {
           out.push(`│ ${ANSI.red}${errLine}${ANSI.reset}`);
         }
@@ -315,7 +354,9 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
     selectedField: 0,
     editingText: false,
     editBuffer: "",
+    operation: initialOptions.operation ?? "upload",
     filePath: initialOptions.filePath ?? "",
+    outputPath: initialOptions.outputPath ?? ".",
     bucket: initialOptions.bucket ?? process.env.S3_BUCKET ?? process.env.AWS_BUCKET ?? "",
     key: initialOptions.key ?? "",
     endpoint: initialOptions.endpoint ?? process.env.S3_ENDPOINT ?? process.env.AWS_ENDPOINT ?? "",
@@ -353,7 +394,7 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
   process.stdin.setRawMode(true);
   process.stdin.resume();
 
-  const startUpload = async () => {
+  const startTransfer = async () => {
     state.errorText = undefined;
     state.report = undefined;
     state.batchReport = undefined;
@@ -364,6 +405,7 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
     state.phaseSnapshots = {};
     state.logs = [];
 
+    const isDownload = state.operation === "download";
     const rawBucket = state.bucket.trim();
     const parsedTarget = rawBucket ? normalizeS3Target(rawBucket) : undefined;
     const rawKey = state.key.trim();
@@ -373,7 +415,9 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
         : rawKey || parsedTarget?.key || undefined;
 
     const cliOpts: CliOptions = {
+      operation: state.operation,
       filePath: state.filePath.trim(),
+      outputPath: state.outputPath.trim() || ".",
       bucket: parsedTarget?.bucket || undefined,
       key: combinedKey,
       endpoint: state.endpoint.trim() || undefined,
@@ -395,7 +439,7 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
       version: false,
     };
 
-    if (!cliOpts.filePath) {
+    if (!isDownload && !cliOpts.filePath) {
       state.errorText = "Please enter a File, Directory, or Wildcard pattern (or press B to browse).";
       renderScreen(state);
       return;
@@ -408,24 +452,39 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
       return;
     }
 
-    let targets: ResolvedUploadTarget[];
+    const auth = validation.auth;
+    const targetOrigin = resolveTargetEndpointOrigin(auth);
+    const proxy = resolveAndApplyProxy(targetOrigin, initialOptions.proxy);
+    const tls = resolveAndApplyTls(cliOpts);
+
+    let uploadTargets: ResolvedUploadTarget[] = [];
+    let downloadTargets: ResolvedDownloadTarget[] = [];
+
     try {
-      targets = await resolveUploadTargets([cliOpts.filePath], cliOpts.key);
+      if (isDownload) {
+        downloadTargets = await resolveDownloadTargets(
+          cliOpts,
+          auth,
+          proxy,
+          tls,
+          cliOpts.key,
+          cliOpts.outputPath,
+        );
+      } else {
+        uploadTargets = await resolveUploadTargets([cliOpts.filePath!], cliOpts.key);
+      }
     } catch (err) {
       state.errorText = err instanceof Error ? err.message : String(err);
       renderScreen(state);
       return;
     }
 
-    const auth = validation.auth;
-    const targetOrigin = resolveTargetEndpointOrigin(auth);
-    const proxy = resolveAndApplyProxy(targetOrigin, initialOptions.proxy);
-    const tls = resolveAndApplyTls(cliOpts);
-
     state.screen = "running";
     state.logs.push({
       level: "info",
-      text: `Matched ${targets.length} file(s) -> s3://${auth.bucket} via ${targetOrigin}`,
+      text: isDownload
+        ? `Matched ${downloadTargets.length} remote object(s) from s3://${auth.bucket} via ${targetOrigin}`
+        : `Matched ${uploadTargets.length} file(s) -> s3://${auth.bucket} via ${targetOrigin}`,
     });
     if (proxy.activeProxyUrl) {
       state.logs.push({
@@ -483,18 +542,30 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
     };
 
     try {
-      if (targets.length === 1) {
+      if (isDownload) {
+        if (downloadTargets.length === 1) {
+          const report = await executeS3Download(downloadTargets[0]!, cliOpts, auth, proxy, tls, callbacks);
+          state.report = report;
+          state.screen = "summary";
+          exitCode = report.success ? 0 : 1;
+        } else {
+          const batchReport = await executeBatchDownload(downloadTargets, cliOpts, auth, proxy, tls, callbacks);
+          state.batchReport = batchReport;
+          state.screen = "summary";
+          exitCode = batchReport.success ? 0 : 1;
+        }
+      } else if (uploadTargets.length === 1) {
         const singleOpts: CliOptions = {
           ...cliOpts,
-          filePath: targets[0]!.localPath,
-          key: targets[0]!.objectKey,
+          filePath: uploadTargets[0]!.localPath,
+          key: uploadTargets[0]!.objectKey,
         };
         const report = await executeS3Upload(singleOpts, auth, proxy, tls, callbacks);
         state.report = report;
         state.screen = "summary";
         exitCode = report.success ? 0 : 1;
       } else {
-        const batchReport = await executeBatchUpload(targets, cliOpts, auth, proxy, tls, callbacks);
+        const batchReport = await executeBatchUpload(uploadTargets, cliOpts, auth, proxy, tls, callbacks);
         state.batchReport = batchReport;
         state.screen = "summary";
         exitCode = batchReport.success ? 0 : 1;
@@ -565,7 +636,11 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
             return;
           }
           if (key === "u" || key === "U") {
-            state.filePath = state.browseDir;
+            if (state.operation === "download") {
+              state.outputPath = state.browseDir;
+            } else {
+              state.filePath = state.browseDir;
+            }
             state.screen = "config";
             renderScreen(state);
             return;
@@ -596,7 +671,11 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
               state.browseIndex = 0;
               renderScreen(state);
             } else {
-              state.filePath = chosen.fullPath;
+              if (state.operation === "download") {
+                state.outputPath = chosen.fullPath;
+              } else {
+                state.filePath = chosen.fullPath;
+              }
               state.screen = "config";
               renderScreen(state);
             }
@@ -608,11 +687,13 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
         if (state.editingText) {
           if (key === "\r" || key === "\n") {
             const val = state.editBuffer;
-            if (state.selectedField === 0) state.filePath = val;
-            else if (state.selectedField === 1) state.bucket = val;
-            else if (state.selectedField === 2) state.key = val;
-            else if (state.selectedField === 3) state.endpoint = val;
-            else if (state.selectedField === 4) state.region = val;
+            if (state.selectedField === 1) {
+              if (state.operation === "download") state.outputPath = val;
+              else state.filePath = val;
+            } else if (state.selectedField === 2) state.bucket = val;
+            else if (state.selectedField === 3) state.key = val;
+            else if (state.selectedField === 4) state.endpoint = val;
+            else if (state.selectedField === 5) state.region = val;
             state.editingText = false;
             renderScreen(state);
             return;
@@ -645,10 +726,10 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
           return;
         }
         if (key === "s" || key === "S") {
-          await startUpload();
+          await startTransfer();
           return;
         }
-        const totalFields = 10;
+        const totalFields = 11;
         if (key === "\x1b[A") {
           state.selectedField = (state.selectedField + totalFields - 1) % totalFields;
           renderScreen(state);
@@ -660,36 +741,41 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
           return;
         }
         if (key === "\r" || key === "\n" || key === " ") {
-          if (state.selectedField <= 4) {
+          if (state.selectedField === 0) {
+            state.operation = state.operation === "upload" ? "download" : "upload";
+            renderScreen(state);
+          } else if (state.selectedField >= 1 && state.selectedField <= 5) {
             const current =
-              state.selectedField === 0
-                ? state.filePath
-                : state.selectedField === 1
+              state.selectedField === 1
+                ? state.operation === "download"
+                  ? state.outputPath
+                  : state.filePath
+                : state.selectedField === 2
                   ? state.bucket
-                  : state.selectedField === 2
+                  : state.selectedField === 3
                     ? state.key
-                    : state.selectedField === 3
+                    : state.selectedField === 4
                       ? state.endpoint
                       : state.region;
             state.editingText = true;
             state.editBuffer = current;
             renderScreen(state);
-          } else if (state.selectedField === 5) {
+          } else if (state.selectedField === 6) {
             const idx = PART_SIZE_CHOICES.indexOf(state.partSizeMiB);
             state.partSizeMiB = PART_SIZE_CHOICES[(idx + 1) % PART_SIZE_CHOICES.length]!;
             renderScreen(state);
-          } else if (state.selectedField === 6) {
+          } else if (state.selectedField === 7) {
             state.queueSize = state.queueSize >= 8 ? 1 : state.queueSize + 1;
             renderScreen(state);
-          } else if (state.selectedField === 7) {
+          } else if (state.selectedField === 8) {
             const idx = VERIFY_CHOICES.indexOf(state.verifyMode);
             state.verifyMode = VERIFY_CHOICES[(idx + 1) % VERIFY_CHOICES.length]!;
             renderScreen(state);
-          } else if (state.selectedField === 8) {
+          } else if (state.selectedField === 9) {
             const idx = OVERWRITE_CHOICES.indexOf(state.overwritePolicy);
             state.overwritePolicy = OVERWRITE_CHOICES[(idx + 1) % OVERWRITE_CHOICES.length]!;
             renderScreen(state);
-          } else if (state.selectedField === 9) {
+          } else if (state.selectedField === 10) {
             state.allowInvalidCerts = !state.allowInvalidCerts;
             renderScreen(state);
           }

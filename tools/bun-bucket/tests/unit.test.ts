@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { parseCliArgs } from "../src/cli.ts";
+import { extractStaticPrefix } from "../src/downloader.ts";
 import {
   formatMissingConfigError,
   matchesNoProxy,
@@ -185,6 +186,36 @@ describe("CLI argument parser", () => {
     expect(withoutPrefix.filePaths).toHaveLength(4);
     expect(withoutPrefix.bucket).toBe("s3-ibd-ne-saeast1-mwlcr0neostabdbops-pro");
     expect(withoutPrefix.key).toBe("dumps/20261116/");
+  });
+
+  test("parses download invocations via subcommand, --download flag, and s3:// auto-detection", () => {
+    const autoS3 = parseCliArgs(["s3://prod-backups/dumps/CLBP_01.DMP", "./restore"]);
+    expect(autoS3.operation).toBe("download");
+    expect(autoS3.bucket).toBe("prod-backups");
+    expect(autoS3.key).toBe("dumps/CLBP_01.DMP");
+    expect(autoS3.outputPath).toBe("./restore");
+
+    const noScheme = parseCliArgs(["download", "prod-backups/dumps/20261116/*.DMP", "./dumps-out"]);
+    expect(noScheme.operation).toBe("download");
+    expect(noScheme.bucket).toBe("prod-backups");
+    expect(noScheme.key).toBe("dumps/20261116/*.DMP");
+    expect(noScheme.outputPath).toBe("./dumps-out");
+
+    const splitArgs = parseCliArgs(["download", "prod-backups", "dumps/*.DMP", "./out"]);
+    expect(splitArgs.operation).toBe("download");
+    expect(splitArgs.bucket).toBe("prod-backups");
+    expect(splitArgs.key).toBe("dumps/*.DMP");
+    expect(splitArgs.outputPath).toBe("./out");
+
+    const flagArgs = parseCliArgs(["--download", "-b", "prod-backups", "--key", "site/**/*.js", "-o", "./dist"]);
+    expect(flagArgs.operation).toBe("download");
+    expect(flagArgs.bucket).toBe("prod-backups");
+    expect(flagArgs.key).toBe("site/**/*.js");
+    expect(flagArgs.outputPath).toBe("./dist");
+
+    expect(extractStaticPrefix("dumps/20261116/CLBP_*.DMP")).toBe("dumps/20261116/CLBP_");
+    expect(extractStaticPrefix("site/**/*.js")).toBe("site/");
+    expect(extractStaticPrefix("exact/file.bin")).toBe("exact/file.bin");
   });
 
   test("rejects unknown flags and invalid verify modes", () => {
