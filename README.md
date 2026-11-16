@@ -148,11 +148,11 @@ python parse_expdp_log.py export_prod.log -o exported_tables.csv
 #### End-to-End Oracle Data Pump Audit & S3 Offload Workflow
 ```bash
 # 1. Generate table-level export summary CSV from expdp log
-python tools/datapump-log-parser/parse_expdp_log.py /storage/dumps/clbp_export.log -o /storage/dumps/clbp_export.csv
+python tools/datapump-log-parser/parse_expdp_log.py /storage/dumps/database_export.log -o /storage/dumps/database_export.csv
 
 # 2. Upload all dump files and CSV report to S3 with multipart transfer & SHA-256 verification
-./bun-bucket-linux-x64 /storage/dumps/CLBP_CRT_* s3://db-backups-bucket/dumps/20261116/ --skip-existing
-./bun-bucket-linux-x64 /storage/dumps/clbp_export.csv s3://db-backups-bucket/dumps/20261116/ --yes
+./bun-bucket-linux-x64 /storage/dumps/db_schema_* s3://db-backups-bucket/dumps/20261116/ --skip-existing
+./bun-bucket-linux-x64 /storage/dumps/db_export.csv s3://db-backups-bucket/dumps/20261116/ --yes
 ```
 
 ---
