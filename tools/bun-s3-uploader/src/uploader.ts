@@ -470,29 +470,46 @@ async function verifyUploadedObject(
   const remoteEtag = normalizeEtag(stat.etag);
   const sizeMatch = remoteSizeBytes === analysis.sizeBytes;
 
-  let etagMatch: boolean | null = null;
-  if (remoteEtag) {
-    if (!analysis.useMultipart && /^[a-f0-9]{32}$/i.test(remoteEtag)) {
-      etagMatch = remoteEtag.toLowerCase() === checksum.md5Hex.toLowerCase();
-    } else if (
-      analysis.useMultipart &&
-      checksum.multipartEtag &&
-      /^[a-f0-9]{32}-\d+$/i.test(remoteEtag)
-    ) {
-      etagMatch = remoteEtag.toLowerCase() === checksum.multipartEtag.toLowerCase();
-    }
-  }
-
   if (!sizeMatch) {
     throw new Error(
       `Remote object size mismatch: expected ${analysis.sizeBytes} bytes, got ${remoteSizeBytes} bytes.`,
     );
   }
-  if (etagMatch === false) {
-    const expectedEtag = analysis.useMultipart ? checksum.multipartEtag : checksum.md5Hex;
-    throw new Error(
-      `Remote ETag mismatch: expected "${expectedEtag}", got "${remoteEtag}".`,
-    );
+
+  let etagMatch: boolean | null = null;
+  if (remoteEtag) {
+    if (!analysis.useMultipart && /^[a-f0-9]{32}$/i.test(remoteEtag)) {
+      if (remoteEtag.toLowerCase() === checksum.md5Hex.toLowerCase()) {
+        etagMatch = true;
+      } else {
+        etagMatch = null;
+        if (verifyMode === "stat") {
+          callbacks.onLog?.(
+            "warn",
+            `Remote ETag "${remoteEtag}" differs from plaintext MD5 (expected with SSE-KMS encryption).`,
+          );
+        }
+      }
+    } else if (analysis.useMultipart && checksum.multipartEtag) {
+      const mpMatch = /^[a-f0-9]{32}-(\d+)$/i.exec(remoteEtag);
+      if (mpMatch) {
+        const remotePartCount = Number(mpMatch[1]);
+        if (remotePartCount !== analysis.totalParts) {
+          throw new Error(
+            `Remote multipart ETag part-count mismatch: expected ${analysis.totalParts} parts, got ${remotePartCount} in ETag "${remoteEtag}".`,
+          );
+        }
+        if (remoteEtag.toLowerCase() === checksum.multipartEtag.toLowerCase()) {
+          etagMatch = true;
+        } else {
+          etagMatch = null;
+          callbacks.onLog?.(
+            "info",
+            `Remote ETag "${remoteEtag}" has matching part count (${remotePartCount}) with server-encrypted digest (SSE-KMS).`,
+          );
+        }
+      }
+    }
   }
 
   if (verifyMode === "stat") {

@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../src/cli.ts";
@@ -12,6 +12,7 @@ import {
 let workDir = "";
 let smallFilePath = "";
 let largeFilePath = "";
+let batchDirPath = "";
 let savedEnv: Record<string, string | undefined> = {};
 
 const ENV_KEYS = [
@@ -43,8 +44,13 @@ beforeAll(async () => {
   workDir = mkdtempSync(join(tmpdir(), "bun-s3-int-"));
   smallFilePath = join(workDir, "hello-s3.txt");
   largeFilePath = join(workDir, "large-11mb.bin");
+  batchDirPath = join(workDir, "site");
+  mkdirSync(join(batchDirPath, "assets"), { recursive: true });
 
   await Bun.write(smallFilePath, "Native Bun S3 integration test payload with SHA-256 verification.");
+  await Bun.write(join(batchDirPath, "index.html"), "<h1>Index</h1>");
+  await Bun.write(join(batchDirPath, "notes.txt"), "Notes");
+  await Bun.write(join(batchDirPath, "assets", "app.js"), "console.log('ok');");
 
   // 11 MiB -> 3 parts with 5 MiB partSize (5 MiB + 5 MiB + 1 MiB)
   const big = new Uint8Array(11 * 1024 * 1024);
@@ -111,7 +117,7 @@ describe("End-to-end S3 CLI & Uploader integration", () => {
       expect(code).toBe(0);
       expect(mock.stats.singlePartPuts).toBe(1);
       expect(mock.stats.multipartInitiations).toBe(0);
-      expect(mock.stats.headRequests).toBe(1);
+      expect(mock.stats.headRequests).toBe(2);
       expect(mock.stats.getRequests).toBe(1);
 
       const stored = mock.objects.get("my-test-bucket/nested/hello.txt");
@@ -246,6 +252,169 @@ describe("End-to-end S3 CLI & Uploader integration", () => {
       expect(report.verification.sha256Match).toBe(true);
     } finally {
       mock.stop();
+    }
+  });
+
+  test("uploads entire directories recursively and wildcard patterns with prefix", async () => {
+    const mock = startMockS3Server();
+    try {
+      process.env.AWS_ACCESS_KEY_ID = "test-access-key";
+      process.env.AWS_SECRET_ACCESS_KEY = "test-secret-key";
+      process.env.AWS_ENDPOINT = mock.origin;
+
+      // Entire directory upload
+      const dirCode = await runCli([batchDirPath, "site-bucket", "--prefix", "v2"]);
+      expect(dirCode).toBe(0);
+      expect(mock.objects.has("site-bucket/v2/index.html")).toBe(true);
+      expect(mock.objects.has("site-bucket/v2/notes.txt")).toBe(true);
+      expect(mock.objects.has("site-bucket/v2/assets/app.js")).toBe(true);
+
+      // Wildcard upload (*.html and assets/*.js via glob)
+      const wildcardCode = await runCli([join(batchDirPath, "**", "*.js"), "js-bucket"]);
+      expect(wildcardCode).toBe(0);
+      expect(mock.objects.has("js-bucket/assets/app.js")).toBe(true);
+      expect(mock.objects.has("js-bucket/index.html")).toBe(false);
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("requires confirmation before overwriting existing objects and respects --skip-existing / --yes / interactive choices", async () => {
+    const mock = startMockS3Server();
+    try {
+      process.env.AWS_ACCESS_KEY_ID = "test-access-key";
+      process.env.AWS_SECRET_ACCESS_KEY = "test-secret-key";
+      process.env.AWS_ENDPOINT = mock.origin;
+
+      // Seed existing object
+      mock.objects.set("ov-bucket/hello-s3.txt", {
+        bucket: "ov-bucket",
+        key: "hello-s3.txt",
+        data: new TextEncoder().encode("OLD_CONTENT"),
+        etag: "old-etag",
+        contentType: "text/plain",
+        lastModified: new Date(),
+      });
+
+      // 1. Non-interactive without --yes or --skip-existing must refuse overwrite
+      const refusedCode = await runCli([smallFilePath, "ov-bucket"]);
+      expect(refusedCode).toBe(1);
+      expect(Buffer.from(mock.objects.get("ov-bucket/hello-s3.txt")!.data).toString()).toBe("OLD_CONTENT");
+
+      // 2. --skip-existing skips cleanly without overwriting
+      const skippedCode = await runCli([smallFilePath, "ov-bucket", "--skip-existing"]);
+      expect(skippedCode).toBe(0);
+      expect(Buffer.from(mock.objects.get("ov-bucket/hello-s3.txt")!.data).toString()).toBe("OLD_CONTENT");
+
+      // 3. Interactive confirmation: "skip" keeps old content
+      let promptCalls = 0;
+      const userSkipCode = await runCli([smallFilePath, "ov-bucket"], {
+        confirmOverwrite: async () => {
+          promptCalls++;
+          return "skip";
+        },
+      });
+      expect(userSkipCode).toBe(0);
+      expect(promptCalls).toBe(1);
+      expect(Buffer.from(mock.objects.get("ov-bucket/hello-s3.txt")!.data).toString()).toBe("OLD_CONTENT");
+
+      // 4. Interactive confirmation: "overwrite" replaces content
+      const userOverwriteCode = await runCli([smallFilePath, "ov-bucket"], {
+        confirmOverwrite: async () => "overwrite",
+      });
+      expect(userOverwriteCode).toBe(0);
+      expect(Buffer.from(mock.objects.get("ov-bucket/hello-s3.txt")!.data).toString()).toBe(
+        "Native Bun S3 integration test payload with SHA-256 verification.",
+      );
+
+      // 5. Batch overwrite-all: prompt once for multiple existing objects, then auto-overwrite rest
+      mock.objects.set("site-ov/index.html", {
+        bucket: "site-ov",
+        key: "index.html",
+        data: new TextEncoder().encode("OLD_HTML"),
+        etag: "e1",
+        contentType: "text/html",
+        lastModified: new Date(),
+      });
+      mock.objects.set("site-ov/notes.txt", {
+        bucket: "site-ov",
+        key: "notes.txt",
+        data: new TextEncoder().encode("OLD_NOTES"),
+        etag: "e2",
+        contentType: "text/plain",
+        lastModified: new Date(),
+      });
+
+      let batchPromptCount = 0;
+      const batchCode = await runCli([batchDirPath, "site-ov"], {
+        confirmOverwrite: async () => {
+          batchPromptCount++;
+          return "overwrite-all";
+        },
+      });
+      expect(batchCode).toBe(0);
+      expect(batchPromptCount).toBe(1);
+      expect(Buffer.from(mock.objects.get("site-ov/index.html")!.data).toString()).toBe("<h1>Index</h1>");
+      expect(Buffer.from(mock.objects.get("site-ov/notes.txt")!.data).toString()).toBe("Notes");
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("normalizes targets missing s3:// prefix, appends filename suffix on folder targets, and handles bash-expanded files", async () => {
+    const mock = startMockS3Server();
+    try {
+      process.env.AWS_ACCESS_KEY_ID = "test-access-key";
+      process.env.AWS_SECRET_ACCESS_KEY = "test-secret-key";
+      process.env.AWS_ENDPOINT = mock.origin;
+
+      // Single file target without `s3://` and without trailing slash (folder prefix)
+      const codeNoSlash = await runCli([smallFilePath, "no-scheme-bucket/dumps/20261116"]);
+      expect(codeNoSlash).toBe(0);
+      expect(mock.objects.has("no-scheme-bucket/dumps/20261116/hello-s3.txt")).toBe(true);
+
+      // Single file target without `s3://` and with trailing slash
+      const codeSlash = await runCli([smallFilePath, "no-scheme-bucket/dumps/20261117/"]);
+      expect(codeSlash).toBe(0);
+      expect(mock.objects.has("no-scheme-bucket/dumps/20261117/hello-s3.txt")).toBe(true);
+
+      // Bash-expanded positional files + target without `s3://`
+      const f1 = join(batchDirPath, "index.html");
+      const f2 = join(batchDirPath, "notes.txt");
+      const f3 = join(batchDirPath, "assets", "app.js");
+      const expandedCode = await runCli([f1, f2, f3, "expanded-bucket/dumps/20261116/"]);
+      expect(expandedCode).toBe(0);
+      expect(mock.objects.has("expanded-bucket/dumps/20261116/index.html")).toBe(true);
+      expect(mock.objects.has("expanded-bucket/dumps/20261116/notes.txt")).toBe(true);
+      expect(mock.objects.has("expanded-bucket/dumps/20261116/app.js")).toBe(true);
+    } finally {
+      mock.stop();
+    }
+  });
+
+  test("succeeds on multipart SSE-KMS encrypted buckets where ETag digest differs but part count and SHA-256 match", async () => {
+    const mockSseKms = startMockS3Server({ simulateSseKms: true });
+    try {
+      process.env.AWS_ACCESS_KEY_ID = "test-access-key";
+      process.env.AWS_SECRET_ACCESS_KEY = "test-secret-key";
+      process.env.AWS_ENDPOINT = mockSseKms.origin;
+
+      const code = await runCli([
+        largeFilePath,
+        "kms-bucket/dumps/20261116/",
+        "--part-size",
+        "5M",
+        "--queue-size",
+        "3",
+        "--verify",
+        "full",
+      ]);
+      expect(code).toBe(0);
+      const stored = mockSseKms.objects.get("kms-bucket/dumps/20261116/large-11mb.bin");
+      expect(stored).toBeDefined();
+      expect(stored!.etag).toBe(`${"a".repeat(32)}-3`);
+    } finally {
+      mockSseKms.stop();
     }
   });
 });

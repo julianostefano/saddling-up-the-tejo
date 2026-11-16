@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import {
   DEFAULT_LINK_SPEED_MBPS,
   DEFAULT_MULTIPART_THRESHOLD,
@@ -10,8 +11,8 @@ import {
   formatEta,
   formatSpeed,
   maskProxyUrl,
+  normalizeS3Target,
   parseByteSize,
-  parseS3Uri,
   renderProgressBar,
 } from "./format.ts";
 import {
@@ -25,7 +26,7 @@ import {
   startIsolatedBatchUploadSession,
   startIsolatedUploadSession,
 } from "./session-runner.ts";
-import { resolveUploadTargets } from "./shell.ts";
+import { hasGlobPattern, resolveUploadTargets } from "./shell.ts";
 import { executeBatchUpload, executeS3Upload } from "./uploader.ts";
 import type {
   BatchUploadReport,
@@ -233,7 +234,11 @@ export function parseCliArgs(argv: string[]): CliOptions {
       case "-b":
       case "--bucket": {
         const res = readValue(i, flag, inlineVal);
-        options.bucket = res.value;
+        const parsed = normalizeS3Target(res.value);
+        options.bucket = parsed.bucket;
+        if (parsed.key && !options.key) {
+          options.key = parsed.key;
+        }
         i = res.nextIdx;
         break;
       }
@@ -345,25 +350,81 @@ export function parseCliArgs(argv: string[]): CliOptions {
     throw new Error("Cannot combine --yes/--overwrite with --skip-existing/--no-overwrite.");
   }
 
-  // Assign positional arguments:
-  // If --file was NOT given: <file-dir-or-glob> <bucket-or-s3-uri> [key-or-prefix]
-  // If --file WAS given and --bucket was NOT given: first positional can be bucket/s3-uri.
-  if (positionals.length > 0 && options.filePaths!.length === 0) {
-    const first = positionals.shift()!;
-    options.filePaths!.push(first);
-    options.filePath = first;
-  }
-  if (positionals.length > 0 && !options.bucket) {
-    const next = positionals.shift()!;
-    const s3Uri = parseS3Uri(next);
-    if (s3Uri) {
-      options.bucket = s3Uri.bucket;
-      if (s3Uri.key && !options.key) {
-        options.key = s3Uri.key;
+  const applyTargetString = (targetStr: string) => {
+    const parsed = normalizeS3Target(targetStr);
+    options.bucket = parsed.bucket;
+    if (parsed.key) {
+      if (!options.key) {
+        options.key = parsed.key;
+      } else {
+        options.key = `${parsed.key.replace(/\/+$/, "")}/${options.key.replace(/^\/+/, "")}`;
       }
-    } else {
-      options.bucket = next;
     }
+  };
+
+  // Assign positional arguments, including shell-expanded wildcards (<file1> <file2> ... <target>)
+  // and targets provided without an explicit `s3://` prefix.
+  if (positionals.length > 0 && options.filePaths!.length === 0) {
+    if (positionals.length === 1) {
+      const only = positionals.shift()!;
+      options.filePaths!.push(only);
+      options.filePath = only;
+    } else if (positionals.length === 2) {
+      if (!options.bucket) {
+        const first = positionals.shift()!;
+        options.filePaths!.push(first);
+        options.filePath = first;
+        applyTargetString(positionals.shift()!);
+      } else {
+        const second = positionals[1]!;
+        if (existsSync(second) || hasGlobPattern(second)) {
+          options.filePaths!.push(...positionals);
+          options.filePath = positionals[0];
+          positionals.length = 0;
+        } else {
+          const first = positionals.shift()!;
+          options.filePaths!.push(first);
+          options.filePath = first;
+        }
+      }
+    } else if (options.bucket) {
+      const last = positionals[positionals.length - 1]!;
+      if (!existsSync(last) && !hasGlobPattern(last) && !options.key) {
+        const fileArgs = positionals.slice(0, -1);
+        options.filePaths!.push(...fileArgs);
+        options.filePath = fileArgs[0];
+        options.key = last;
+      } else {
+        options.filePaths!.push(...positionals);
+        options.filePath = positionals[0];
+      }
+      positionals.length = 0;
+    } else {
+      const last = positionals[positionals.length - 1]!;
+      const secondLast = positionals[positionals.length - 2]!;
+      const isMultiFileWithLastTarget =
+        /^s3:\/\//i.test(last) ||
+        existsSync(secondLast) ||
+        hasGlobPattern(secondLast) ||
+        positionals.length >= 4;
+
+      if (isMultiFileWithLastTarget) {
+        const fileArgs = positionals.slice(0, -1);
+        options.filePaths!.push(...fileArgs);
+        options.filePath = fileArgs[0];
+        applyTargetString(last);
+        positionals.length = 0;
+      } else {
+        const first = positionals.shift()!;
+        options.filePaths!.push(first);
+        options.filePath = first;
+        applyTargetString(positionals.shift()!);
+      }
+    }
+  }
+
+  if (positionals.length > 0 && !options.bucket) {
+    applyTargetString(positionals.shift()!);
   }
   if (positionals.length > 0 && !options.key) {
     options.key = positionals.shift();

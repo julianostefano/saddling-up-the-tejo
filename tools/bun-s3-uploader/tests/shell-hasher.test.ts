@@ -1,20 +1,31 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { computeFileChecksumsInWorker } from "../src/hasher.ts";
-import { inspectLocalPathWithShell, listDirectoryEntriesWithShell } from "../src/shell.ts";
+import {
+  hasGlobPattern,
+  inspectLocalPathWithShell,
+  listDirectoryEntriesWithShell,
+  resolveUploadTargets,
+} from "../src/shell.ts";
 
 let workDir = "";
 let smallFile = "";
 let multiPartFile = "";
+let batchDir = "";
 
 beforeAll(async () => {
   workDir = mkdtempSync(join(tmpdir(), "bun-s3-shell-hash-"));
   smallFile = join(workDir, "small-sample.txt");
   multiPartFile = join(workDir, "multipart-sample.bin");
+  batchDir = join(workDir, "bundle");
+  mkdirSync(join(batchDir, "nested"), { recursive: true });
 
   await Bun.write(smallFile, "Hello Bun Shell & Worker Hasher!");
+  await Bun.write(join(batchDir, "app.log"), "root log");
+  await Bun.write(join(batchDir, "readme.md"), "docs");
+  await Bun.write(join(batchDir, "nested", "trace.log"), "nested log");
 
   // 6 MiB deterministic payload (> 5 MiB part size)
   const buf = new Uint8Array(6 * 1024 * 1024);
@@ -46,6 +57,25 @@ describe("Bun Shell ($) integration", () => {
     const names = entries.map((e) => e.name);
     expect(names).toContain("small-sample.txt");
     expect(names).toContain("multipart-sample.bin");
+  });
+
+  test("resolves directories and wildcard patterns with Bun.Glob", async () => {
+    expect(hasGlobPattern("logs/*.log")).toBe(true);
+    expect(hasGlobPattern("./file.txt")).toBe(false);
+
+    const dirTargets = await resolveUploadTargets([batchDir], "releases/v1");
+    expect(dirTargets.map((t) => t.objectKey)).toEqual([
+      "releases/v1/app.log",
+      "releases/v1/nested/trace.log",
+      "releases/v1/readme.md",
+    ]);
+
+    const globPattern = join(batchDir, "**", "*.log");
+    const globTargets = await resolveUploadTargets([globPattern], "logs");
+    expect(globTargets.map((t) => t.objectKey)).toEqual([
+      "logs/app.log",
+      "logs/nested/trace.log",
+    ]);
   });
 });
 

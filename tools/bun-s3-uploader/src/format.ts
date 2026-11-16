@@ -173,7 +173,7 @@ export function computeS3MultipartEtag(partMd5Digests: Uint8Array[]): string {
  * Parses an "s3://bucket/key" URI into bucket and key components.
  */
 export function parseS3Uri(uri: string): { bucket: string; key: string } | null {
-  if (!uri.startsWith("s3://")) return null;
+  if (!/^s3:\/\//i.test(uri)) return null;
   const rest = uri.slice("s3://".length);
   const slashIdx = rest.indexOf("/");
   if (slashIdx === -1) {
@@ -183,4 +183,20 @@ export function parseS3Uri(uri: string): { bucket: string; key: string } | null 
     bucket: rest.slice(0, slashIdx),
     key: rest.slice(slashIdx + 1),
   };
+}
+
+/**
+ * Normalizes an S3 target string (with or without an `s3://` prefix) into bucket, key, and canonical URI.
+ */
+export function normalizeS3Target(rawTarget: string): {
+  bucket: string;
+  key: string;
+  normalizedUri: string;
+} {
+  const cleaned = rawTarget.trim().replace(/^s3:\/\//i, "").replace(/^\/+/, "");
+  const slashIdx = cleaned.indexOf("/");
+  const bucket = slashIdx === -1 ? cleaned : cleaned.slice(0, slashIdx);
+  const key = slashIdx === -1 ? "" : cleaned.slice(slashIdx + 1);
+  const normalizedUri = key ? `s3://${bucket}/${key}` : `s3://${bucket}`;
+  return { bucket, key, normalizedUri };
 }

@@ -227,6 +227,34 @@ export async function resolveUploadTargets(
 
     const inspection = await inspectLocalPathWithShell(rawInput);
     if (!inspection.exists) {
+      // Fallback: test if appending a wildcard suffix (`${rawInput}*`) matches files before reporting missing path
+      const { baseDir, pattern } = splitGlobBaseAndPattern(`${rawInput}*`);
+      const fallbackGlob = new Glob(pattern);
+      let fallbackMatches = 0;
+
+      for await (const relMatch of fallbackGlob.scan({
+        cwd: baseDir,
+        onlyFiles: true,
+        dot: includeHidden,
+      })) {
+        const absFile = resolve(baseDir, relMatch);
+        if (seenPaths.has(absFile)) continue;
+        seenPaths.add(absFile);
+        fallbackMatches++;
+
+        const normalizedRel = normalizeSlashes(relMatch);
+        targets.push({
+          localPath: absFile,
+          relativePath: normalizedRel,
+          objectKey: joinObjectKey(keyOrPrefix, normalizedRel),
+          sizeBytes: Bun.file(absFile).size,
+        });
+      }
+
+      if (fallbackMatches > 0) {
+        continue;
+      }
+
       throw new Error(`Input path does not exist: "${inspection.absolutePath}".`);
     }
 
@@ -265,11 +293,32 @@ export async function resolveUploadTargets(
     if (seenPaths.has(inspection.absolutePath)) continue;
     seenPaths.add(inspection.absolutePath);
 
-    // If a single file was passed with explicit `--key`, treat `--key` as the full object key.
-    // If multiple files were passed with `--key`/`--prefix`, treat it as a key prefix.
-    const objectKey = isSingleLiteralInput
-      ? (keyOrPrefix?.trim() ? normalizeSlashes(keyOrPrefix.trim()).replace(/^\/+/, "") : inspection.fileName)
-      : joinObjectKey(keyOrPrefix, inspection.fileName);
+    // For a single literal file, append the filename if keyOrPrefix ends with `/` or looks like a folder prefix.
+    let objectKey: string;
+    if (isSingleLiteralInput) {
+      const trimmedKey = keyOrPrefix?.trim();
+      if (!trimmedKey) {
+        objectKey = inspection.fileName;
+      } else {
+        const cleanKey = normalizeSlashes(trimmedKey).replace(/^\/+/, "");
+        const endsWithSlash = cleanKey.endsWith("/");
+        const cleanKeyNoTrailing = cleanKey.replace(/\/+$/, "");
+        const lastSegment = cleanKeyNoTrailing.split("/").pop() ?? "";
+        const fileHasExt = inspection.fileName.includes(".") && !inspection.fileName.startsWith(".");
+        const targetLastHasExt = lastSegment.includes(".") && !lastSegment.startsWith(".");
+
+        if (
+          endsWithSlash ||
+          (fileHasExt && !targetLastHasExt && lastSegment.toLowerCase() !== inspection.fileName.toLowerCase())
+        ) {
+          objectKey = joinObjectKey(cleanKeyNoTrailing, inspection.fileName);
+        } else {
+          objectKey = cleanKeyNoTrailing;
+        }
+      }
+    } else {
+      objectKey = joinObjectKey(keyOrPrefix, inspection.fileName);
+    }
 
     targets.push({
       localPath: inspection.absolutePath,

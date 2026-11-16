@@ -1,3 +1,4 @@
+import { normalizeS3Target } from "./format.ts";
 import type {
   CliOptions,
   EnvValidationResult,
@@ -55,6 +56,10 @@ export function validateAndResolveAuth(
     : readEnv(env, "S3_BUCKET", "AWS_BUCKET");
   const sessionTokenRes = readEnv(env, "S3_SESSION_TOKEN", "AWS_SESSION_TOKEN");
 
+  if (bucketRes.value && (bucketRes.value.includes("/") || /^s3:\/\//i.test(bucketRes.value))) {
+    bucketRes.value = normalizeS3Target(bucketRes.value).bucket;
+  }
+
   if (!accessKey.value) {
     missing.push({
       field: "accessKeyId",
@@ -92,6 +97,12 @@ export function validateAndResolveAuth(
   }
 
   if (endpointRes.value) {
+    if (!endpointRes.value.includes("://")) {
+      const scheme = /^(localhost|127\.0\.0\.1)(:|\/|$)/i.test(endpointRes.value)
+        ? "http://"
+        : "https://";
+      endpointRes.value = `${scheme}${endpointRes.value}`;
+    }
     try {
       const parsed = new URL(endpointRes.value);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {

@@ -108,7 +108,9 @@ export function generateSelfSignedCert(): { keyPem: string; certPem: string } {
 /**
  * Starts an in-process S3-compatible mock server (HTTP or self-signed HTTPS) using `Bun.serve`.
  */
-export function startMockS3Server(options: { tls?: { key: string; cert: string } } = {}) {
+export function startMockS3Server(
+  options: { tls?: { key: string; cert: string }; simulateSseKms?: boolean } = {},
+) {
   const objects = new Map<string, StoredS3Object>();
   const uploads = new Map<string, ActiveMultipart>();
   let uploadSeq = 1;
@@ -190,7 +192,9 @@ export function startMockS3Server(options: { tls?: { key: string; cert: string }
           offset += part.data.byteLength;
           md5Parts.push(part.md5Raw);
         }
-        const finalEtag = computeS3MultipartEtag(md5Parts);
+        const finalEtag = options.simulateSseKms
+          ? `${"a".repeat(32)}-${orderedNumbers.length}`
+          : computeS3MultipartEtag(md5Parts);
         objects.set(objectMapKey, {
           bucket: active.bucket,
           key: active.key,

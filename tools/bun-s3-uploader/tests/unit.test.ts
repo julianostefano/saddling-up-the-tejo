@@ -15,6 +15,7 @@ import {
   formatEta,
   formatSpeed,
   maskProxyUrl,
+  normalizeS3Target,
   parseByteSize,
   parseS3Uri,
   renderProgressBar,
@@ -46,13 +47,28 @@ describe("format utilities", () => {
     expect(() => parseByteSize("abc")).toThrow();
   });
 
-  test("masks proxy credentials and parses S3 URIs", () => {
+  test("masks proxy credentials, parses S3 URIs, and normalizes S3 targets without s3://", () => {
     expect(maskProxyUrl("http://alice:s3cr3t@proxy.corp:8080")).toBe("http://***:***@proxy.corp:8080");
     expect(parseS3Uri("s3://my-bucket/folder/file.tar.gz")).toEqual({
       bucket: "my-bucket",
       key: "folder/file.tar.gz",
     });
     expect(parseS3Uri("my-bucket")).toBeNull();
+    expect(normalizeS3Target("s3://my-bucket/dumps/20261116/")).toEqual({
+      bucket: "my-bucket",
+      key: "dumps/20261116/",
+      normalizedUri: "s3://my-bucket/dumps/20261116/",
+    });
+    expect(normalizeS3Target("my-bucket/dumps/20261116/")).toEqual({
+      bucket: "my-bucket",
+      key: "dumps/20261116/",
+      normalizedUri: "s3://my-bucket/dumps/20261116/",
+    });
+    expect(normalizeS3Target("my-bucket")).toEqual({
+      bucket: "my-bucket",
+      key: "",
+      normalizedUri: "s3://my-bucket",
+    });
   });
 
   test("computes S3 multipart ETag", () => {
@@ -140,6 +156,35 @@ describe("CLI argument parser", () => {
     expect(opts.insecure).toBe(true);
     expect(opts.verifyMode).toBe("stat");
     expect(opts.isolated).toBe(true);
+  });
+
+  test("parses bash-expanded multi-file positionals with and without s3:// prefix", () => {
+    const withPrefix = parseCliArgs([
+      "/tmp/CLBP_CRT_261112_01.DMP",
+      "/tmp/CLBP_CRT_261112_02.DMP",
+      "/tmp/CLBP_CRT_261112_03.DMP",
+      "/tmp/CLBP_CRT_261112_04.DMP",
+      "s3://s3-ibd-ne-saeast1-mwlcr0neostabdbops-pro/dumps/20261116/",
+    ]);
+    expect(withPrefix.filePaths).toEqual([
+      "/tmp/CLBP_CRT_261112_01.DMP",
+      "/tmp/CLBP_CRT_261112_02.DMP",
+      "/tmp/CLBP_CRT_261112_03.DMP",
+      "/tmp/CLBP_CRT_261112_04.DMP",
+    ]);
+    expect(withPrefix.bucket).toBe("s3-ibd-ne-saeast1-mwlcr0neostabdbops-pro");
+    expect(withPrefix.key).toBe("dumps/20261116/");
+
+    const withoutPrefix = parseCliArgs([
+      "/tmp/CLBP_CRT_261112_01.DMP",
+      "/tmp/CLBP_CRT_261112_02.DMP",
+      "/tmp/CLBP_CRT_261112_03.DMP",
+      "/tmp/CLBP_CRT_261112_04.DMP",
+      "s3-ibd-ne-saeast1-mwlcr0neostabdbops-pro/dumps/20261116/",
+    ]);
+    expect(withoutPrefix.filePaths).toHaveLength(4);
+    expect(withoutPrefix.bucket).toBe("s3-ibd-ne-saeast1-mwlcr0neostabdbops-pro");
+    expect(withoutPrefix.key).toBe("dumps/20261116/");
   });
 
   test("rejects unknown flags and invalid verify modes", () => {

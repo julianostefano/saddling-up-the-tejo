@@ -12,6 +12,7 @@ import {
   formatEta,
   formatSpeed,
   maskProxyUrl,
+  normalizeS3Target,
   renderProgressBar,
 } from "./format.ts";
 import {
@@ -363,10 +364,18 @@ export async function runTui(initialOptions: Partial<CliOptions> = {}): Promise<
     state.phaseSnapshots = {};
     state.logs = [];
 
+    const rawBucket = state.bucket.trim();
+    const parsedTarget = rawBucket ? normalizeS3Target(rawBucket) : undefined;
+    const rawKey = state.key.trim();
+    const combinedKey =
+      parsedTarget?.key && rawKey
+        ? `${parsedTarget.key.replace(/\/+$/, "")}/${rawKey.replace(/^\/+/, "")}`
+        : rawKey || parsedTarget?.key || undefined;
+
     const cliOpts: CliOptions = {
       filePath: state.filePath.trim(),
-      bucket: state.bucket.trim() || undefined,
-      key: state.key.trim() || undefined,
+      bucket: parsedTarget?.bucket || undefined,
+      key: combinedKey,
       endpoint: state.endpoint.trim() || undefined,
       region: state.region.trim() || undefined,
       partSize: state.partSizeMiB * MIB,
